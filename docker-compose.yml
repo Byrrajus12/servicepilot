@@ -21,6 +21,7 @@ services:
       DATABASE_URL: ${COMPOSE_DATABASE_URL:-postgresql+asyncpg://servicepilot@db:5432/servicepilot}
       PGPASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
       DEALERSHIP_API_KEYS: ${DEALERSHIP_API_KEYS:-}
+      ENABLE_SMS_SIMULATION: ${ENABLE_SMS_SIMULATION:-false}
     depends_on:
       db:
         condition: service_healthy

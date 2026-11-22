@@ -1,6 +1,6 @@
 # ServicePilot
 
-ServicePilot is a multi-tenant service advisor backend for automotive dealerships. Its FastAPI API uses a PostgreSQL-backed mock DMS to look up customers and vehicles, find service availability, and manage appointments.
+ServicePilot is a multi-tenant service advisor backend for automotive dealerships. Its FastAPI API uses a PostgreSQL-backed mock DMS to look up customers and vehicles, find service availability, and manage appointments. A development endpoint can receive simulated inbound SMS and store conversation history.
 
 ## Start with Docker Compose
 
@@ -67,6 +67,21 @@ Slots follow the dealership's wall clock. If a clock change interrupts a slot's 
 
 Internal callers can use `AppointmentService(MockDMSAdapter(session, tenant_id))` directly with a trusted tenant ID and a transaction from `build_session_factory(engine).begin()`. Booking, rescheduling, and cancellation hold the dealership row lock until the transaction ends, so capacity checks and writes run in order for each dealership.
 
+## Simulate inbound SMS
+
+Set `ENABLE_SMS_SIMULATION=true` in the development `.env` and apply the latest migration. With Compose, run `docker compose up -d --build api` to recreate the API with the new setting. Use the same dealership API key configured above.
+
+```sh
+curl http://localhost:8000/simulations/sms \
+  -H "X-API-Key: $SERVICEPILOT_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"sender_phone":"+12065550101","body":"Can I book an oil change?","external_message_id":"demo-sms-001"}'
+```
+
+A successful request returns HTTP 200 with `conversation_id`, `message_id`, and `status: "persisted"`. This is a storage acknowledgement. Reusing the optional `external_message_id` with the same dealership returns the original IDs and `status: "duplicate"`. Use a fresh ID for each new message. Every request without an external ID represents a new message.
+
+The route uses a fixed development recipient. Within a dealership, messages between the same sender and recipient reuse the open conversation. A single customer phone match links the customer, while zero or multiple matches keep the conversation unassigned. If a previously linked customer's match changes, the next inbound message opens a fresh conversation. Use this route with development data and leave the setting disabled in deployed environments.
+
 ## Run tests
 
 Set `POSTGRES_PASSWORD` in `.env`, then run the test image. It creates `servicepilot_test` on the bundled PostgreSQL server if needed.
@@ -77,7 +92,7 @@ docker compose run --rm --build tests
 
 To run pytest on the host, create a dedicated PostgreSQL test database, point `TEST_DATABASE_URL` at it, and run `uv run --locked pytest`. The test role needs permission to create schemas.
 
-The suite applies Alembic migrations in a temporary schema and removes it at the end of the run. It uses independent committed transactions to verify concurrent bookings.
+The suite applies Alembic migrations in a temporary schema and removes it at the end of the run. It uses independent committed transactions to verify concurrent bookings and inbound SMS delivery.
 
 ## Code layout
 
@@ -85,6 +100,7 @@ The suite applies Alembic migrations in a temporary schema and removes it at the
 | --- | --- |
 | `servicepilot/` | FastAPI entry point, database setup, domain models, and development seed command |
 | `servicepilot/appointments/` | Scheduling rules, appointment services, request schemas, and API routes |
+| `servicepilot/conversations/` | Inbound SMS persistence, simulation endpoint, and typed conversation context |
 | `servicepilot/integrations/` | DMS adapter interface and PostgreSQL-backed mock implementation |
 | `alembic/` | PostgreSQL schema migrations |
-| `tests/` | Health, appointment API, concurrency, schema, and seed tests backed by PostgreSQL |
+| `tests/` | Health, appointment, conversation, concurrency, schema, and seed tests backed by PostgreSQL |
