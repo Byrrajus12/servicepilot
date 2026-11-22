@@ -9,8 +9,10 @@ from pydantic import BaseModel
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
+from servicepilot.appointments.routes import appointment_error, router
+from servicepilot.appointments.service import AppointmentError
 from servicepilot.config import Settings
-from servicepilot.db.session import build_engine
+from servicepilot.db.session import build_engine, build_session_factory
 
 
 class HealthStatus(BaseModel):
@@ -20,14 +22,18 @@ class HealthStatus(BaseModel):
 def create_app(settings: Settings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        engine = build_engine(settings or Settings())
+        app.state.settings = settings or Settings()
+        engine = build_engine(app.state.settings)
         app.state.engine = engine
+        app.state.session_factory = build_session_factory(engine)
         try:
             yield
         finally:
             await engine.dispose()
 
     app = FastAPI(title="ServicePilot", lifespan=lifespan)
+    app.include_router(router)
+    app.add_exception_handler(AppointmentError, appointment_error)
 
     @app.get("/health")
     async def health() -> HealthStatus:

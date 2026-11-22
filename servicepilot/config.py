@@ -1,13 +1,26 @@
-from pydantic import field_validator
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import ArgumentError
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore", hide_input_in_errors=True)
+    model_config = SettingsConfigDict(
+        env_file=".env", extra="ignore", env_ignore_empty=True, hide_input_in_errors=True,
+    )
 
     database_url: str
+    dealership_api_keys: dict[str, SecretStr] = Field(default_factory=dict)
+
+    @field_validator("dealership_api_keys")
+    @classmethod
+    def validate_api_keys(cls, keys: dict[str, SecretStr]) -> dict[str, SecretStr]:
+        values = [key.get_secret_value() for key in keys.values()]
+        if any(not key or any(not 33 <= ord(char) <= 126 for char in key) for key in values):
+            raise ValueError("Dealership API keys must contain visible ASCII characters only")
+        if len(set(values)) != len(values):
+            raise ValueError("Dealership API keys must be unique")
+        return keys
 
     @field_validator("database_url")
     @classmethod
