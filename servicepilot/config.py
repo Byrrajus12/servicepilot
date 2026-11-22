@@ -11,6 +11,7 @@ class Settings(BaseSettings):
 
     database_url: str
     dealership_api_keys: dict[str, SecretStr] = Field(default_factory=dict)
+    enable_sms_simulation: bool = False
 
     @field_validator("dealership_api_keys")
     @classmethod

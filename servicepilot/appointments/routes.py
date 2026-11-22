@@ -1,13 +1,9 @@
-from collections.abc import AsyncIterator
 from datetime import date
-from hmac import compare_digest
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, Security
+from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import JSONResponse
-from fastapi.security import APIKeyHeader
-from sqlalchemy import select
 
 from servicepilot.appointments.schemas import (
     AppointmentResponse,
@@ -26,31 +22,14 @@ from servicepilot.appointments.service import (
     RecordNotFound,
 )
 from servicepilot.integrations.mock_dms import MockDMSAdapter
-from servicepilot.tenancy.models import Tenant
+from servicepilot.tenancy.auth import DealershipTransaction
 
 router = APIRouter()
-api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 
-async def appointment_service(
-    request: Request, api_key: Annotated[str | None, Security(api_key_header)],
-) -> AsyncIterator[AppointmentService]:
-    slug = None
-    if api_key:
-        provided = api_key.encode()
-        for dealership, key in request.app.state.settings.dealership_api_keys.items():
-            if compare_digest(provided, key.get_secret_value().encode()):
-                slug = dealership
-
-    unauthorized = HTTPException(401, "Invalid API key", headers={"WWW-Authenticate": "APIKey"})
-    if slug is None:
-        raise unauthorized
-
-    async with request.app.state.session_factory.begin() as session:
-        tenant_id = await session.scalar(select(Tenant.id).where(Tenant.slug == slug))
-        if tenant_id is None:
-            raise unauthorized
-        yield AppointmentService(MockDMSAdapter(session, tenant_id))
+async def appointment_service(dealership: DealershipTransaction) -> AppointmentService:
+    session, tenant_id = dealership
+    return AppointmentService(MockDMSAdapter(session, tenant_id))
 
 
 Service = Annotated[AppointmentService, Depends(appointment_service, scope="function")]
