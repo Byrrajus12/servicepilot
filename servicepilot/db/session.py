@@ -4,7 +4,7 @@ from servicepilot.config import Settings
 
 
 def build_engine(settings: Settings) -> AsyncEngine:
-    return create_async_engine(settings.database_url, pool_pre_ping=True)
+    return create_async_engine(settings.database_url, pool_pre_ping=True, isolation_level="READ COMMITTED")
 
 
 def build_session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
