@@ -16,7 +16,7 @@ FROM base AS test
 RUN uv sync --locked --no-cache
 COPY tests ./tests
 USER servicepilot
-CMD ["python", "-m", "pytest", "-o", "cache_dir=/tmp/pytest-cache", "tests"]
+CMD ["sh", "-c", "python tests/create_database.py && exec python -m pytest -o cache_dir=/tmp/pytest-cache tests"]
 
 FROM base AS production
 USER servicepilot

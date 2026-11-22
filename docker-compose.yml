@@ -18,7 +18,9 @@ services:
   api:
     build: .
     environment:
-      DATABASE_URL: ${COMPOSE_DATABASE_URL:?Set COMPOSE_DATABASE_URL}
+      DATABASE_URL: ${COMPOSE_DATABASE_URL:-postgresql+asyncpg://servicepilot@db:5432/servicepilot}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+      DEALERSHIP_API_KEYS: ${DEALERSHIP_API_KEYS:-}
     depends_on:
       db:
         condition: service_healthy
@@ -31,7 +33,8 @@ services:
       context: .
       target: test
     environment:
-      TEST_DATABASE_URL: ${COMPOSE_TEST_DATABASE_URL:-}
+      TEST_DATABASE_URL: postgresql+asyncpg://servicepilot@db:5432/servicepilot_test
+      PGPASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
     depends_on:
       db:
         condition: service_healthy
