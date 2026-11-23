@@ -1,9 +1,9 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, time
 from typing import Literal
 from uuid import UUID
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, JsonValue
-from sqlalchemy import select
+from sqlalchemy import or_, select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from servicepilot.appointments.schemas import AppointmentResponse, CustomerResponse, VehicleResponse
@@ -11,6 +11,7 @@ from servicepilot.conversations.models import (
     ConfirmationState, Conversation, ConversationStatus, CustomerResolution, Message,
 )
 from servicepilot.conversations.service import resolve_customer
+from servicepilot.customers.models import Customer
 from servicepilot.integrations.mock_dms import MockDMSAdapter
 
 
@@ -21,6 +22,10 @@ class DealershipContext(BaseModel):
     slug: str
     name: str
     timezone: str
+    service_days: list[int]
+    opens_at: time
+    closes_at: time
+    appointment_minutes: int
 
 
 class PendingActionContext(BaseModel):
@@ -57,6 +62,7 @@ class ConversationContext(BaseModel):
 
 async def build_context(
     session: AsyncSession, tenant_id: UUID, conversation_id: UUID, *, history_limit: int = 20,
+    before_inbound: Message | None = None,
 ) -> ConversationContext | None:
     if not 1 <= history_limit <= 50:
         raise ValueError("history_limit must be between 1 and 50")
@@ -74,14 +80,7 @@ async def build_context(
     if dealership is None:
         return None
 
-    resolution: CustomerResolution | Literal["stale"] = conversation.customer_resolution
-    customer = None
-    if conversation.sender_number is not None:
-        resolution, customer = await resolve_customer(session, tenant_id, conversation.sender_number)
-        if customer is not None and customer.id != conversation.customer_id:
-            resolution, customer = "stale", None
-    elif conversation.customer_id is not None:
-        customer = await dms.customer(conversation.customer_id)
+    resolution, customer = await current_identity(session, conversation)
 
     now = datetime.now(UTC)
     pending = None
@@ -105,12 +104,11 @@ async def build_context(
 
     vehicles = await dms.vehicles(customer.id) if customer is not None else []
     appointments = await dms.upcoming(customer.id, now) if customer is not None else []
-    newest = (await session.scalars(
-        select(Message).where(
-            Message.tenant_id == tenant_id, Message.conversation_id == conversation_id,
-        ).order_by(Message.occurred_at.desc(), Message.created_at.desc(), Message.id.desc())
-        .limit(history_limit)
-    )).all()
+    newest = await read_history(
+        session, tenant_id, conversation_id, history_limit, before_inbound=before_inbound,
+    )
+    if before_inbound is not None and customer is None and conversation.customer_id is not None:
+        newest = []
     return ConversationContext(
         operations=ConversationOperations(
             dealership=DealershipContext.model_validate(dealership),
@@ -122,5 +120,40 @@ async def build_context(
             upcoming_appointments=[AppointmentResponse.model_validate(item) for item in appointments],
             pending_action=pending,
         ),
-        history=[HistoryMessage.model_validate(message) for message in reversed(newest)],
+        history=newest,
     )
+
+
+async def current_identity(
+    session: AsyncSession, conversation: Conversation,
+) -> tuple[CustomerResolution | Literal["stale"], Customer | None]:
+    if conversation.sender_number is not None:
+        resolution, customer = await resolve_customer(
+            session, conversation.tenant_id, conversation.sender_number,
+        )
+        if customer is not None and customer.id != conversation.customer_id:
+            return "stale", None
+        return resolution, customer
+    if conversation.customer_id is not None:
+        customer = await MockDMSAdapter(session, conversation.tenant_id).customer(conversation.customer_id)
+        return ("resolved", customer) if customer is not None else ("stale", None)
+    return conversation.customer_resolution, None
+
+
+async def read_history(
+    session: AsyncSession, tenant_id: UUID, conversation_id: UUID, history_limit: int,
+    *, before_inbound: Message | None = None,
+) -> list[HistoryMessage]:
+    query = select(Message).where(
+        Message.tenant_id == tenant_id, Message.conversation_id == conversation_id,
+    )
+    if before_inbound is not None:
+        query = query.where(or_(
+            Message.direction == "outbound",
+            tuple_(Message.created_at, Message.id) < (before_inbound.created_at, before_inbound.id),
+        ))
+    newest = (await session.scalars(
+        query.order_by(Message.occurred_at.desc(), Message.created_at.desc(), Message.id.desc())
+        .limit(history_limit)
+    )).all()
+    return [HistoryMessage.model_validate(message) for message in reversed(newest)]
