@@ -65,6 +65,7 @@ class Message(TenantOwned, Base):
         ForeignKeyConstraint(
             ["tenant_id", "conversation_id"], ["conversations.tenant_id", "conversations.id"]
         ),
+        UniqueConstraint("tenant_id", "conversation_id", "id"),
         CheckConstraint("direction IN ('inbound', 'outbound')", name="direction"),
         Index(None, "tenant_id", "conversation_id", "occurred_at", "created_at", "id"),
         Index(
