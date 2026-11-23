@@ -12,6 +12,10 @@ class Settings(BaseSettings):
     database_url: str
     dealership_api_keys: dict[str, SecretStr] = Field(default_factory=dict)
     enable_sms_simulation: bool = False
+    openai_api_key: SecretStr | None = None
+    agent_model: str = Field(default="gpt-4.1-mini", min_length=1, max_length=120)
+    agent_timeout_seconds: float = Field(default=30, ge=1, le=120)
+    agent_max_turns: int = Field(default=5, ge=1, le=10)
 
     @field_validator("dealership_api_keys")
     @classmethod
