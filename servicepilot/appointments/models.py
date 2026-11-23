@@ -16,6 +16,7 @@ class Appointment(TenantOwned, Base):
             ["vehicles.tenant_id", "vehicles.customer_id", "vehicles.id"],
         ),
         UniqueConstraint("tenant_id", "external_dms_id"),
+        UniqueConstraint("tenant_id", "customer_id", "id"),
         CheckConstraint("scheduled_end > scheduled_start", name="schedule_order"),
         CheckConstraint("status IN ('scheduled', 'completed', 'cancelled')", name="status"),
         Index(None, "tenant_id", "scheduled_start"),

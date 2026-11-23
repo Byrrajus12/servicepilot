@@ -1,10 +1,10 @@
-from datetime import UTC, datetime
 from uuid import UUID
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from servicepilot.conversations.models import Conversation, CustomerResolution, Message
+from servicepilot.conversations.pending import retire_pending
 from servicepilot.conversations.schemas import InboundResult, InboundSMS
 from servicepilot.customers.models import Customer
 
@@ -55,10 +55,7 @@ async def persist_inbound(
     if conversation is not None and (conversation.customer_resolution, conversation.customer_id) != (
         resolution, customer_id,
     ):
-        conversation.pending_action_type = None
-        conversation.pending_action_payload = None
-        conversation.pending_action_expires_at = None
-        conversation.pending_confirmation = None
+        retire_pending(session, conversation, "identity_required")
         if conversation.customer_id is not None:
             # A new customer association must not inherit another customer's thread or pending action.
             conversation.status = "closed"
@@ -75,7 +72,7 @@ async def persist_inbound(
         )
         session.add(conversation)
         await session.flush()
-    received_at = datetime.now(UTC)
+    received_at = await session.scalar(select(func.clock_timestamp()))
     message = Message(
         tenant_id=tenant_id, conversation_id=conversation.id, direction="inbound",
         from_number=sms.sender_phone, to_number=sms.recipient_phone, body=sms.body,
