@@ -137,17 +137,20 @@ class AppointmentService:
         slot = await self._available_slot(dealer, start, vehicle_id)
         return await self.dms.book(customer_id, vehicle_id, slot.start, slot.end, service_type)
 
+    async def check_slot(self, start: datetime, vehicle_id: UUID, excluding: UUID | None = None) -> Slot:
+        return await self._available_slot(await self._dealership(), start, vehicle_id, excluding)
+
     async def reschedule(self, appointment_id: UUID, start: datetime) -> Appointment:
         dealer = await self._dealership(lock_schedule=True)
         appointment = await self.appointment(appointment_id)
-        self._require_upcoming(appointment)
+        self.require_upcoming(appointment)
         slot = await self._available_slot(dealer, start, appointment.vehicle_id, appointment.id)
         return await self.dms.reschedule(appointment.id, slot.start, slot.end)
 
     async def cancel(self, appointment_id: UUID) -> Appointment:
         await self._dealership(lock_schedule=True)
         appointment = await self.appointment(appointment_id)
-        self._require_upcoming(appointment)
+        self.require_upcoming(appointment)
         return await self.dms.cancel(appointment.id)
 
     async def _dealership(self, *, lock_schedule: bool = False) -> Tenant:
@@ -161,7 +164,7 @@ class AppointmentService:
             raise RecordNotFound("Customer not found")
 
     @staticmethod
-    def _require_upcoming(appointment: Appointment) -> None:
+    def require_upcoming(appointment: Appointment) -> None:
         if appointment.status != "scheduled" or appointment.scheduled_start <= datetime.now(UTC):
             raise AppointmentConflict("Only upcoming scheduled appointments can be changed")
 
