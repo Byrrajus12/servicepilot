@@ -7,12 +7,13 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 
+from servicepilot.agent.models import AgentExecution
 from servicepilot.config import Settings
 from servicepilot.conversations.context import build_context
 from servicepilot.conversations.routes import SIMULATED_RECIPIENT
 from servicepilot.conversations.schemas import InboundSMS
 from servicepilot.conversations.service import persist_inbound
-from servicepilot.db.models import Appointment, Conversation, Customer, Message, Tenant, Vehicle
+from servicepilot.db.models import Appointment, AppointmentActionResult, Conversation, Customer, Message, Tenant, Vehicle
 from servicepilot.db.session import build_session_factory
 from servicepilot.main import create_app
 
@@ -58,7 +59,7 @@ async def sms_data(migrated_database):
     finally:
         async with sessions.begin() as session:
             tenant_ids = [local.id, foreign.id]
-            for model in (Message, Conversation, Appointment, Vehicle, Customer):
+            for model in (AppointmentActionResult, AgentExecution, Message, Conversation, Appointment, Vehicle, Customer):
                 await session.execute(delete(model).where(model.tenant_id.in_(tenant_ids)))
             await session.execute(delete(Tenant).where(Tenant.id.in_(tenant_ids)))
 
