@@ -1,7 +1,8 @@
+import pytest
 from sqlalchemy import func, select
 
 from servicepilot.db.models import Appointment, Customer, Tenant, Vehicle
-from servicepilot.seed import seed_database
+from servicepilot.seed import create_simulation_customer, seed_database
 
 
 async def test_seed_is_repeatable_and_creates_two_consistent_dealerships(session):
@@ -58,3 +59,17 @@ async def test_demo_catalog_backfill_preserves_existing_knowledge_and_limits_sco
     await session.flush()
     await seed_database(session, backfill_service_catalog=True)
     assert cedar.service_catalog == {}
+
+
+async def test_new_simulation_customer_is_scoped_and_has_no_appointment(session):
+    await seed_database(session)
+    with pytest.raises(ValueError, match="seeded demo dealerships"):
+        await create_simulation_customer(session, "other-dealer")
+    phones = [await create_simulation_customer(session, "cedar-ridge-motors") for _ in range(2)]
+    assert len(set(phones)) == 2
+    rows = (await session.execute(select(Customer, Tenant.slug).join(Tenant).where(Customer.phone_number.in_(phones)))).all()
+    assert len(rows) == 2
+    for customer, slug in rows:
+        assert slug == "cedar-ridge-motors"
+        assert await session.scalar(select(Vehicle.id).where(Vehicle.customer_id == customer.id))
+        assert not await session.scalar(select(Appointment.id).where(Appointment.customer_id == customer.id))

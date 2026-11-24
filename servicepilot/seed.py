@@ -2,14 +2,14 @@ import asyncio
 from argparse import ArgumentParser
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from uuid import NAMESPACE_URL, uuid5
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from servicepilot.config import Settings
-from servicepilot.db.models import Appointment, Customer, Tenant, Vehicle
+from servicepilot.db.models import Appointment, Conversation, Customer, Tenant, Vehicle
 from servicepilot.db.session import build_engine, build_session_factory
 
 
@@ -56,6 +56,7 @@ DEMO_SERVICES = {
     },
 }
 DEMO_POLICIES = {"arrival": "Please check in at the service desk with your vehicle key."}
+SIMULATION_CUSTOMER_PREFIX = "+142555501"
 
 
 async def seed_database(session: AsyncSession, *, backfill_service_catalog: bool = False) -> None:
@@ -115,15 +116,63 @@ async def seed_database(session: AsyncSession, *, backfill_service_catalog: bool
             )
 
 
+async def create_simulation_customer(session: AsyncSession, slug: str) -> str:
+    demo = next((visits[0] for demo_slug, _, visits in DEALERSHIPS if slug == demo_slug), None)
+    if demo is None:
+        raise ValueError("Choose one of the seeded demo dealerships.")
+    tenant = await session.scalar(select(Tenant).where(Tenant.slug == slug).with_for_update())
+    if tenant is None or not await session.scalar(select(Customer.id).where(
+        Customer.tenant_id == tenant.id, Customer.phone_number == demo.phone_number,
+        Customer.id == uuid5(NAMESPACE_URL, f"servicepilot/demo/{tenant.id}/customer/1"),
+    )):
+        raise ValueError("Seed the demo dealership before creating a simulation customer.")
+
+    used = set(await session.scalars(select(Customer.phone_number).where(
+        Customer.tenant_id == tenant.id, Customer.phone_number.startswith(SIMULATION_CUSTOMER_PREFIX),
+    ).union(select(Conversation.sender_number).where(
+        Conversation.tenant_id == tenant.id, Conversation.sender_number.startswith(SIMULATION_CUSTOMER_PREFIX),
+    ))))
+    for index in range(100):
+        phone = f"{SIMULATION_CUSTOMER_PREFIX}{index:02}"
+        if phone not in used:
+            break
+    else:
+        raise ValueError("All reserved simulation customer numbers are in use for this dealership.")
+
+    customer_id = uuid4()
+    await session.execute(insert(Customer).values(
+        id=customer_id, tenant_id=tenant.id, name=f"Simulation Customer {index:02}", phone_number=phone,
+    ))
+    await session.execute(insert(Vehicle).values(
+        tenant_id=tenant.id, customer_id=customer_id, vin=f"SPSIM{customer_id.hex[:12].upper()}",
+        make=demo.make, model=demo.model, model_year=demo.model_year,
+    ))
+    return phone
+
+
 async def main() -> None:
     parser = ArgumentParser(description="Seed the fictional ServicePilot dealerships.")
-    parser.add_argument("--backfill-service-catalog", action="store_true",
-                        help="Fill empty service catalogs for the existing demo dealerships.")
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--backfill-service-catalog", action="store_true",
+                       help="Fill empty service catalogs for the existing demo dealerships.")
+    modes.add_argument("--new-simulation-customer", metavar="DEALERSHIP",
+                       help="Create a fresh fictional customer and vehicle for local SMS simulation.")
     args = parser.parse_args()
-    engine = build_engine(Settings())
+    settings = Settings()
+    if args.new_simulation_customer and (not settings.enable_sms_simulation or settings.sms_transport != "simulation"):
+        parser.error("Creating a simulation customer requires enabled SMS simulation and simulation transport.")
+    engine = build_engine(settings)
     try:
+        phone = None
         async with build_session_factory(engine).begin() as session:
-            await seed_database(session, backfill_service_catalog=args.backfill_service_catalog)
+            if args.new_simulation_customer:
+                phone = await create_simulation_customer(session, args.new_simulation_customer)
+            else:
+                await seed_database(session, backfill_service_catalog=args.backfill_service_catalog)
+        if phone is not None:
+            print(phone)
+    except ValueError as exc:
+        parser.error(str(exc))
     finally:
         await engine.dispose()
 
