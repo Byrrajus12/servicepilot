@@ -35,7 +35,7 @@ from servicepilot.sms.delivery import enqueue_reply
 from servicepilot.sms.policy import consent_for, is_suppressed, twilio_route_matches
 from servicepilot.sms.retry import retry_delay
 from servicepilot.staff.consultations import (
-    active_consultation, consultation_still_relevant, latest_inbound, thread_consultations,
+    active_consultation, consultation_still_relevant, latest_inbound, pending_consultation, thread_consultations,
     unfinished_customer_turn,
 )
 from servicepilot.staff.models import Consultation
@@ -155,8 +155,13 @@ async def unverified_commitment(
         return "model_authored_appointment_commitment"
     if output.staff_commitment == "new_request" and not context.consultation_questions:
         return "missing_staged_consultation"
-    if output.staff_commitment == "existing_request" and not context.awaiting_staff:
-        return "missing_active_consultation"
+    if output.staff_commitment == "existing_request":
+        reference = output.consultation_reference
+        known = {item["id"] for item in context.consultations if item["status"] in ("open", "answered")}
+        if (reference is None or reference not in known or reference in output.superseded_consultations
+                or await pending_consultation(session, conversation, reference) is None
+        ):
+            return "missing_active_consultation"
     if output.availability_checked and not any(
         item["name"] == "get_available_slots" and item["outcome"] == "ok" for item in context.tool_calls
     ):

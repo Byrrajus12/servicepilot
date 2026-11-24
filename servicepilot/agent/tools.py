@@ -22,6 +22,7 @@ from servicepilot.conversations.context import current_identity
 from servicepilot.conversations.models import Conversation
 from servicepilot.conversations.pending import ActionType, ConditionalRequest, Proposal, PublishedProposal
 from servicepilot.integrations.mock_dms import MockDMSAdapter
+from servicepilot.staff.consultations import pending_consultation
 from servicepilot.tenancy.models import Tenant
 
 RESULT_LIMIT = 10
@@ -395,14 +396,63 @@ async def propose_cancellation(ctx: RunContextWrapper[AdvisorContext], appointme
     return await _propose(ctx.context, "propose_cancellation", "cancel", appointment_id=appointment_id)
 
 
+async def _reuse_consultation(context: AdvisorContext, reference: UUID, addresses_condition: bool) -> dict:
+    unavailable = {"status": "consultation_unavailable"}
+    if context.staff_fact is not None or not any(
+        item["id"] == reference and item["status"] in ("open", "answered") for item in context.consultations
+    ):
+        return unavailable
+    try:
+        async with context.sessions.begin() as session:
+            conversation = await lock_conversation(session, context.tenant_id, context.conversation_id)
+            if (conversation is None or conversation.status != "open" or conversation.owner != "ai"
+                    or conversation.ownership_version != context.ownership_version):
+                return unavailable
+            row = await session.get(AgentExecution, context.inbound_id)
+            now = await session.scalar(select(func.clock_timestamp()))
+            if (row is None or row.tenant_id != context.tenant_id or row.conversation_id != conversation.id
+                    or not owns_lease(row, context.attempt, now)):
+                return unavailable
+            resolution, customer = await current_identity(session, conversation)
+            if (resolution != conversation.customer_resolution
+                    or (customer.id if customer else None) != context.customer_id):
+                return unavailable
+            existing = await pending_consultation(session, conversation, reference)
+            if existing is None or (addresses_condition and (
+                context.condition is None or existing.condition_request_id != context.condition.request_id
+            )):
+                return unavailable
+            return {"status": f"consultation_{existing.status}", "consultation_id": str(existing.id)}
+    except SQLAlchemyError:
+        return {"status": "tool_error"}
+
+
 @function_tool(failure_error_function=tool_failure)
 async def ask_dealership_staff(
     ctx: RunContextWrapper[AdvisorContext],
-    question: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=500)],
+    question: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=500)] | None = None,
     addresses_condition: bool = False,
+    consultation_reference: UUID | None = None,
 ) -> dict:
-    """Stage a distinct private staff question or look up matching work."""
+    """Reuse pending staff work by ID or stage a distinct private staff question.
+
+    Compare the subject, date and vehicle with consultations in context before calling.
+    For the same request phrased differently, pass consultation_reference from context
+    and leave question null. A reference only looks up existing work. If unavailable,
+    do not retry with a paraphrase. Reply directly to status checks using context.
+    For a withdrawal, return the ID in superseded_consultations instead. For distinct
+    requests, pass question with relevant dates and vehicles, and leave the reference null.
+    A consultation_open or consultation_answered result points to existing work. A
+    consultation_resolved result supplies a historical fact, with no new follow-up.
+    """
     context = ctx.context
+    if consultation_reference is not None:
+        result = await _reuse_consultation(context, consultation_reference, addresses_condition)
+        context.tool_calls.append({"name": "ask_dealership_staff", "outcome": result["status"]})
+        return result
+    if question is None:
+        context.tool_calls.append({"name": "ask_dealership_staff", "outcome": "invalid_arguments"})
+        return {"status": "invalid_arguments"}
     question = " ".join(question.split())
     existing = context.consultation_history.get(question.casefold())
     result = {}

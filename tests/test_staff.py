@@ -542,6 +542,159 @@ async def test_unsubstantiated_operational_commitment_is_not_delivered(monkeypat
     assert not inbox.json()["waiting_for_staff"]
 
 
+async def test_consultation_reuses_open_answered_and_recent_resolved_work(monkeypatch, sms_api, sms_data, staff):
+    sessions = sms_data[0]
+    manager, _ = staff["manager"]
+    question = "What is the oil change quote for this customer's appointment?"
+    fact = "The oil change quote is $69.95 before tax."
+    states = []
+    claim_historical_followup = False
+
+    async def model(_, context, model_input):
+        if context.staff_fact is not None:
+            return ModelReply(context.staff_fact, 1, 1)
+        repeated_question = f" {question.upper().replace(' ', '  ')} " if states else question
+        result = await invoke(ask_dealership_staff, context, question=repeated_question)
+        status = result["status"]
+        states.append(status)
+        if status == "consultation_prepared":
+            draft = AdvisorOutput(sms="I'll check the quote for you.", staff_commitment="new_request")
+        elif status in ("consultation_open", "consultation_answered"):
+            draft = AdvisorOutput(
+                sms="I'm still waiting on the quote.", staff_commitment="existing_request",
+                consultation_reference=result["consultation_id"],
+            )
+        else:
+            assert status == "consultation_resolved" and result["approved_fact"] == fact
+            if claim_historical_followup:
+                draft = AdvisorOutput(
+                    sms="I'm still waiting on the quote.", staff_commitment="existing_request",
+                    consultation_reference=result["consultation_id"],
+                )
+            else:
+                draft = AdvisorOutput(sms=result["approved_fact"])
+        return ModelReply(draft.sms, 1, 1, draft)
+
+    monkeypatch.setattr(execution, "run_advisor", model)
+    receipt = await simulate(sms_api, body="How much does my oil change cost?")
+    await process(sms_api, receipt)
+    duplicate = await process(sms_api, await simulate(sms_api, body="Any update on the price?"))
+    assert duplicate["reply"]["body"] == "I'm still waiting on the quote."
+    item, = await list_consultations(sms_api, receipt, manager)
+    path = thread(receipt) + f"/consultations/{item['id']}/answer"
+    assert (await sms_api.put(path, headers=manager, json={"public_fact": fact})).status_code == 200
+    duplicate = await process(sms_api, await simulate(sms_api, body="Did the quote come in?"))
+    assert duplicate["reply"]["body"] == "I'm still waiting on the quote."
+    assert await execution.process_next(sessions, settings_for(sms_api))
+    await drain_delivery(sms_api, sessions, RecordingTransport())
+    reused = await process(sms_api, await simulate(sms_api, body="What was the oil change quote?"))
+    assert reused["reply"]["body"] == fact
+    assert states == ["consultation_prepared", "consultation_open", "consultation_answered", "consultation_resolved"]
+    claim_historical_followup = True
+    stale = await process(sms_api, await simulate(sms_api, body="Could you confirm the earlier quote?"))
+    assert stale["reply"]["body"] == execution.UNVERIFIED_OPERATION_REPLY
+    assert len(await list_consultations(sms_api, receipt, manager)) == 1
+
+    params = {"sender_phone": SHARED_PHONE}
+    local = (await sms_api.get("/simulations/sms", headers=LOCAL_HEADERS, params=params)).json()
+    assert not local["waiting_for_staff"]
+    assert any(row["source"] == "advisor_followup" and row["body"] == fact for row in local["outbound"])
+    foreign = (await sms_api.get("/simulations/sms", headers=FOREIGN_HEADERS, params=params)).json()
+    assert foreign["conversation_id"] is None and foreign["outbound"] == []
+
+
+async def test_consultation_reference_reuses_only_eligible_work_in_the_current_thread(
+    monkeypatch, sms_api, sms_data, staff,
+):
+    manager, _ = staff["manager"]
+    foreign_manager, _ = staff["foreign"]
+    loaner_question = "Is a loaner available this Friday?"
+    shuttle_question = "What time does the shuttle stop on Friday?"
+
+    async def stage_loaner(_, context, model_input):
+        result = await invoke(ask_dealership_staff, context, question=loaner_question)
+        assert result == {"status": "consultation_prepared"}
+        return ModelReply("I'll check whether a loaner is available.", 1, 1)
+
+    monkeypatch.setattr(execution, "run_advisor", stage_loaner)
+    receipt = await simulate(sms_api, body=loaner_question)
+    await process(sms_api, receipt)
+    loaner, = await list_consultations(sms_api, receipt, manager)
+    unrelated = await simulate(sms_api, phone=UNKNOWN_PHONE, body=loaner_question)
+    await process(sms_api, unrelated)
+    other, = await list_consultations(sms_api, unrelated, manager)
+    foreign = await simulate(sms_api, headers=FOREIGN_HEADERS, body=loaner_question)
+    response = await sms_api.post(agent_path(foreign), headers=FOREIGN_HEADERS)
+    assert response.status_code == 200, response.text
+    foreign_loaner, = await list_consultations(sms_api, foreign, foreign_manager)
+
+    async def follow_up(_, context, model_input):
+        assert {str(item["id"]) for item in context.consultations} == {loaner["id"]}
+        for reference in (other["id"], foreign_loaner["id"], str(uuid4())):
+            assert await invoke(
+                ask_dealership_staff, context, question=shuttle_question, consultation_reference=reference,
+            ) == {"status": "consultation_unavailable"}
+        malformed = await invoke(
+            ask_dealership_staff, context, question=shuttle_question, consultation_reference="invalid-id",
+        )
+        assert json.loads(malformed) == {"status": "invalid_arguments"}
+        assert await invoke(
+            ask_dealership_staff, context, consultation_reference=loaner["id"], addresses_condition=True,
+        ) == {"status": "consultation_unavailable"}
+        assert await invoke(
+            ask_dealership_staff, context, question="Can they lend me a car Friday?",
+            consultation_reference=loaner["id"],
+        ) == {"status": "consultation_open", "consultation_id": loaner["id"]}
+        assert not context.consultation_questions
+        draft = AdvisorOutput(
+            sms="The loaner check is still open.", staff_commitment="existing_request",
+            consultation_reference=loaner["id"],
+        )
+        return ModelReply(draft.sms, 1, 1, draft)
+
+    monkeypatch.setattr(execution, "run_advisor", follow_up)
+    result = await process(sms_api, await simulate(sms_api, body="Any word on borrowing a car Friday?"))
+    assert result["reply"]["body"] == "The loaner check is still open."
+    assert await list_consultations(sms_api, receipt, manager) == [loaner]
+
+    async def stage_shuttle(_, context, model_input):
+        assert str(context.consultations[0]["id"]) == loaner["id"]
+        assert await invoke(ask_dealership_staff, context, question=shuttle_question) == {
+            "status": "consultation_prepared",
+        }
+        return ModelReply("I'll check the shuttle hours.", 1, 1)
+
+    monkeypatch.setattr(execution, "run_advisor", stage_shuttle)
+    result = await process(sms_api, await simulate(sms_api, body="When does the shuttle stop Friday?"))
+    assert result["reply"]["body"] == "I'll check the shuttle hours."
+    items = await list_consultations(sms_api, receipt, manager)
+    assert {(item["question"], item["status"]) for item in items} == {
+        (loaner_question, "open"), (shuttle_question, "open"),
+    }
+
+    async def after_cancellation(_, context, model_input):
+        assert any(str(item["id"]) == loaner["id"] for item in context.consultations)
+        path = thread(receipt) + f"/consultations/{loaner['id']}/cancel"
+        assert (await sms_api.put(path, headers=manager)).status_code == 200
+        assert await invoke(
+            ask_dealership_staff, context, question=loaner_question, consultation_reference=loaner["id"],
+        ) == {"status": "consultation_unavailable"}
+        assert not context.consultation_questions
+        draft = AdvisorOutput(
+            sms="The loaner check is still open.", staff_commitment="existing_request",
+            consultation_reference=loaner["id"],
+        )
+        return ModelReply(draft.sms, 1, 1, draft)
+
+    monkeypatch.setattr(execution, "run_advisor", after_cancellation)
+    result = await process(sms_api, await simulate(sms_api, body="Did you hear anything on the loaner?"))
+    assert result["reply"]["body"] == execution.UNVERIFIED_OPERATION_REPLY
+    items = await list_consultations(sms_api, receipt, manager)
+    assert {(item["question"], item["status"]) for item in items} == {
+        (loaner_question, "canceled"), (shuttle_question, "open"),
+    }
+
+
 async def test_conditional_reply_retires_authorization_even_if_customer_later_agrees(
     monkeypatch, sms_api, sms_data, scenario,
 ):

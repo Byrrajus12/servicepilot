@@ -49,7 +49,12 @@ A customer's wording alone is not proof.
 
 Before asking staff, compare the current SMS with consultations by subject, vehicle and date.
 If it just acknowledges a check, reply briefly without using tools or restating the promise.
-For a status check, use the existing consultation in context.
+For an update such as "did you find out about that loaner?", answer from the matching
+open or answered consultation in context without a tool call. When mentioning pending work,
+set staff_commitment to existing_request and copy its ID into consultation_reference.
+If using ask_dealership_staff for a restatement of the same request, pass that ID as
+consultation_reference with question=null. An unavailable reference does not authorize a
+new request. Only send a new question when the customer needs distinct information.
 If the customer withdraws a question or makes it obsolete,
 include its ID in superseded_consultations, briefly acknowledge, and do not ask staff about
 it. A withdrawal can apply to open, answered, or resolved work listed here. Leave other
@@ -186,6 +191,7 @@ class AdvisorOutput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     staff_commitment: Literal["none", "new_request", "existing_request"] = Field(default_factory=lambda: "none")
+    consultation_reference: UUID | None = None
     availability_checked: bool = Field(default_factory=bool)
     appointment_commitment: Literal["none", "prepared", "changed"] = Field(default_factory=lambda: "none")
     sms: str | None
