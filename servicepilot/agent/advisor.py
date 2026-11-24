@@ -214,11 +214,17 @@ class ModelReply:
     output_tokens: int
     operational: AdvisorOutput | None = None
     verified_proposal_information: str | None = None
+    model_calls: int = 0
+    cached_input_tokens: int = 0
+    reasoning_tokens: int = 0
 
     def with_prior_usage(self, prior: "ModelReply") -> "ModelReply":
         return replace(
             self, input_tokens=self.input_tokens + prior.input_tokens,
             output_tokens=self.output_tokens + prior.output_tokens,
+            model_calls=self.model_calls + prior.model_calls,
+            cached_input_tokens=self.cached_input_tokens + prior.cached_input_tokens,
+            reasoning_tokens=self.reasoning_tokens + prior.reasoning_tokens,
         )
 
 
@@ -226,6 +232,9 @@ def usage_reply(result) -> ModelReply:
     usage = result.context_wrapper.usage
     return ModelReply(
         None, usage.input_tokens, usage.output_tokens,
+        model_calls=getattr(usage, "requests", 0),
+        cached_input_tokens=getattr(getattr(usage, "input_tokens_details", None), "cached_tokens", 0) or 0,
+        reasoning_tokens=getattr(getattr(usage, "output_tokens_details", None), "reasoning_tokens", 0) or 0,
     )
 
 
