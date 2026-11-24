@@ -2,7 +2,7 @@ from datetime import datetime
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from servicepilot.agent.models import AgentExecution
@@ -14,6 +14,7 @@ from servicepilot.conversations.pending import (
     PublishedProposal, pending_proposal, retire_pending,
 )
 from servicepilot.integrations.mock_dms import MockDMSAdapter
+from servicepilot.sms.models import SMSDelivery
 
 
 async def lock_conversation(session: AsyncSession, tenant_id: UUID, conversation_id: UUID) -> Conversation | None:
@@ -154,6 +155,7 @@ async def _source_unchanged(service: AppointmentService, proposal: PublishedProp
 
 STALE_REPLY = "Please reply to the latest appointment confirmation text."
 EXPIRED_REPLY = "That request expired. What appointment change would you like to make?"
+UNDELIVERED_REPLY = "I couldn't verify delivery of the confirmation text. Please request the appointment change again."
 
 
 async def handle_confirmation(
@@ -169,16 +171,12 @@ async def handle_confirmation(
     ):
         return "stale_attempt", None
 
-    recorded = await session.scalar(select(AppointmentActionResult).where(
-        AppointmentActionResult.tenant_id == conversation.tenant_id,
-        AppointmentActionResult.conversation_id == conversation.id,
-        AppointmentActionResult.decision_message_id == inbound.id,
-    ))
+    recorded = await recorded_action(session, conversation, inbound)
     if recorded is not None:
-        if recorded.reply_body is None:
-            return recorded.outcome, None
         if await appointment_customer(session, conversation) != recorded.customer_id:
             return "identity_required", HANDOFF
+        if recorded.outcome == "superseded" and recorded.reply_body is None:
+            return "revised", None
         return recorded.outcome, recorded.reply_body
 
     proposal = pending_proposal(conversation)
@@ -211,6 +209,31 @@ async def handle_confirmation(
 
     if conversation.pending_action_expires_at <= max(now, inbound.occurred_at):
         return finalize("expired", EXPIRED_REPLY)
+    delivery = await session.scalar(select(SMSDelivery).where(
+        SMSDelivery.id == proposal.prompt_id, SMSDelivery.tenant_id == conversation.tenant_id,
+        SMSDelivery.conversation_id == conversation.id,
+    ))
+    if (
+        delivery is None or delivery.status != "delivered"
+        or delivery.delivered_at >= min(inbound.created_at, inbound.occurred_at)
+    ):
+        if decision is None:
+            finalize("superseded", UNDELIVERED_REPLY)
+        return "delivery_unverified", UNDELIVERED_REPLY
+    if delivery.provider == "twilio":
+        # An older prompt may have appeared on the phone after this proposal, or still be in flight.
+        ambiguous = await session.scalar(select(SMSDelivery.id).where(
+            SMSDelivery.tenant_id == conversation.tenant_id, SMSDelivery.conversation_id == conversation.id,
+            SMSDelivery.confirmation_for_id.is_not(None), SMSDelivery.provider == "twilio",
+            tuple_(SMSDelivery.created_at, SMSDelivery.id) < (delivery.created_at, delivery.id),
+            or_(
+                SMSDelivery.status.in_(("sending", "uncertain", "accepted", "sent")),
+                SMSDelivery.delivered_at >= delivery.delivered_at,
+            ),
+        ).limit(1))
+        if ambiguous is not None:
+            finalize("superseded", UNDELIVERED_REPLY)
+            return "delivery_unverified", UNDELIVERED_REPLY
     if await appointment_customer(session, conversation) != proposal.customer_id:
         return finalize("identity_required", HANDOFF)
     if decision is None:
@@ -218,11 +241,12 @@ async def handle_confirmation(
     if decision == "decline":
         return finalize("declined", "Okay, I'll leave things as they are.")
     if decision == "revise":
-        # A retry can prepare the new request again, but the old prompt stays retired.
-        retire_pending(session, conversation, "superseded")
-        return "superseded", None
-    if decision != "confirm":
+        finalize("superseded")
+        return "revised", None
+    if decision == "clarify":
         return "confirmation_required", confirmation_prompt(proposal)
+    if decision != "confirm":
+        return "invalid_decision", None
 
     dms = MockDMSAdapter(session, conversation.tenant_id)
     dealer = await dms.dealership(lock_schedule=True)
@@ -236,3 +260,13 @@ async def handle_confirmation(
         return finalize("identity_required", HANDOFF)
     outcome, reply, appointment_id = await _execute(AppointmentService(dms), proposal, dealer.timezone)
     return finalize(outcome, reply, appointment_id)
+
+
+async def recorded_action(
+    session: AsyncSession, conversation: Conversation, inbound: Message,
+) -> AppointmentActionResult | None:
+    return await session.scalar(select(AppointmentActionResult).where(
+        AppointmentActionResult.tenant_id == conversation.tenant_id,
+        AppointmentActionResult.conversation_id == conversation.id,
+        AppointmentActionResult.decision_message_id == inbound.id,
+    ))

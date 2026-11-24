@@ -5,22 +5,24 @@ from typing import Annotated, Literal
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
-from agents import RunContextWrapper, function_tool
-from pydantic import AwareDatetime, StringConstraints
+from agents import FunctionTool, RunContextWrapper, function_tool
+from pydantic import AwareDatetime, StringConstraints, ValidationError
 from sqlalchemy import func, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from servicepilot.agent.actions import appointment_customer, lock_conversation, owns_lease, prepare_proposal
+from servicepilot.agent.confirmation import ConfirmationAttempt, InterpretationInput
 from servicepilot.agent.models import AgentExecution
 from servicepilot.appointments.schemas import AppointmentResponse, SlotResponse, VehicleResponse
 from servicepilot.appointments.service import AppointmentConflict, AppointmentService, InvalidSlot, RecordNotFound
 from servicepilot.conversations.context import current_identity
 from servicepilot.conversations.models import Conversation
-from servicepilot.conversations.pending import ActionType, Proposal, ProposalDecision, PublishedProposal
+from servicepilot.conversations.pending import ActionType, Proposal, PublishedProposal
 from servicepilot.integrations.mock_dms import MockDMSAdapter
 
 RESULT_LIMIT = 10
+INTENT_RECORDED = "intent_recorded"
 AvailabilityPeriod = Literal["morning", "afternoon", "evening"]
 
 
@@ -35,26 +37,40 @@ class AdvisorContext:
     tool_calls: list[dict[str, str]] = field(default_factory=list)
     proposal: Proposal | None = None
     pending: PublishedProposal | None = None
-    decision: ProposalDecision | None = None
+    confirmation: ConfirmationAttempt | None = None
     availability: dict[tuple[date, UUID | None, AvailabilityPeriod | None], list[SlotResponse]] = field(
         default_factory=dict,
     )
     appointment_details: dict[UUID, AppointmentResponse] = field(default_factory=dict)
 
 
-@function_tool
-async def interpret_appointment_reply(
-    ctx: RunContextWrapper[AdvisorContext], decision: ProposalDecision,
-) -> dict:
-    """Classify this SMS for the active proposal. Confirm only clear, unconditional agreement to the exact proposal.
-    Decline a clear refusal, revise a changed request, or clarify any uncertain or conflicting reply.
-    This records intent only. It cannot change an appointment.
-    """
-    context = ctx.context
-    if context.pending is None:
-        return {"status": "no_pending_action"}
-    context.decision = decision if context.decision is None else "clarify"
-    return {"status": "intent_recorded"}
+async def _interpret_appointment_reply(ctx: RunContextWrapper[AdvisorContext], arguments: str) -> str:
+    confirmation = ctx.context.confirmation
+    if ctx.context.pending is None or confirmation is None:
+        return "no_pending_action"
+    confirmation.tool_invocations += 1
+    if confirmation.tool_invocations != 1:
+        confirmation.interpretation = "duplicate"
+        confirmation.decision = None
+        return "duplicate"
+    try:
+        confirmation.decision = InterpretationInput.model_validate_json(arguments).decision
+    except ValidationError:
+        confirmation.interpretation = "invalid"
+        return "invalid"
+    except Exception:
+        confirmation.interpretation = "tool_error"
+        raise
+    confirmation.interpretation = "decided"
+    return INTENT_RECORDED
+
+
+interpret_appointment_reply = FunctionTool(
+    name="interpret_appointment_reply",
+    description="Record the semantic intent of the current SMS for the active proposal.",
+    params_json_schema=InterpretationInput.model_json_schema(),
+    on_invoke_tool=_interpret_appointment_reply,
+)
 
 
 def vehicle_data(vehicle: VehicleResponse) -> dict:
@@ -195,7 +211,7 @@ async def _propose(context: AdvisorContext, name: str, kind: ActionType, **param
                 status = "stale_attempt"
             elif context.customer_id is None or await appointment_customer(session, conversation) != context.customer_id:
                 status = "identity_required"
-            elif context.pending is not None and context.decision != "revise":
+            elif context.pending is not None:
                 status = "pending_decision_required"
             elif context.proposal is not None:
                 status = "proposal_already_prepared"

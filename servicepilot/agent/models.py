@@ -49,4 +49,5 @@ class AgentExecution(TenantOwned, Base):
     input_tokens: Mapped[int | None]
     output_tokens: Mapped[int | None]
     tool_calls: Mapped[list[dict[str, str]]] = mapped_column(JSONB, server_default=text("'[]'::jsonb"))
+    confirmation_attempts: Mapped[list[dict]] = mapped_column(JSONB, server_default=text("'[]'::jsonb"))
     error_code: Mapped[str | None] = mapped_column(String(40))
