@@ -20,7 +20,7 @@ from servicepilot.sms.models import SMSDelivery
 async def lock_conversation(session: AsyncSession, tenant_id: UUID, conversation_id: UUID) -> Conversation | None:
     return await session.scalar(select(Conversation).where(
         Conversation.tenant_id == tenant_id, Conversation.id == conversation_id,
-    ).with_for_update())
+    ).with_for_update().execution_options(populate_existing=True))
 
 
 def owns_lease(row: AgentExecution, attempt: int, now: datetime) -> bool:
@@ -130,6 +130,16 @@ async def _execute(
         if proposal.kind != "cancel":
             # An unchanged, scheduled source appointment means only the proposed slot could have failed.
             if timezone == proposal.timezone and (proposal.kind == "book" or await _source_unchanged(service, proposal)):
+                try:
+                    alternatives = await service.nearby_availability(
+                        proposal.scheduled_start, proposal.vehicle_id, service_type=proposal.service_type,
+                        excluding=proposal.appointment_id,
+                    )
+                except RecordNotFound:
+                    return "appointment_changed", "I couldn't verify the vehicle for that request.", None
+                if alternatives:
+                    choices = ", or ".join(local_time(slot.start, timezone) for slot in alternatives[:2])
+                    return "unavailable", f"That time is no longer available. I can offer {choices}. What works for you?", None
                 return "unavailable", "That time is no longer available. What other day or time works for you?", None
         return "appointment_changed", "That appointment can no longer be changed as requested. Please ask for the current appointment details.", None
 
@@ -161,10 +171,11 @@ UNDELIVERED_REPLY = "I couldn't verify delivery of the confirmation text. Please
 async def handle_confirmation(
     session: AsyncSession, conversation: Conversation, row: AgentExecution, attempt: int, inbound: Message,
     *, expected_proposal: PublishedProposal | None = None, decision: ProposalDecision | None = None,
+    explicit_proposal_reference: bool = False,
 ) -> tuple[str | None, str | None]:
     now = await session.scalar(select(func.clock_timestamp()))
     if (
-        conversation.status != "open" or not owns_lease(row, attempt, now)
+        conversation.status != "open" or conversation.owner != "ai" or not owns_lease(row, attempt, now)
         or (row.tenant_id, row.conversation_id, row.id) != (conversation.tenant_id, conversation.id, inbound.id)
         or (inbound.tenant_id, inbound.conversation_id, inbound.direction, inbound.from_number, inbound.to_number)
         != (conversation.tenant_id, conversation.id, "inbound", conversation.sender_number, conversation.recipient_number)
@@ -238,12 +249,20 @@ async def handle_confirmation(
         return finalize("identity_required", HANDOFF)
     if decision is None:
         return None, None
+    if decision == "unrelated":
+        conversation.pending_action_payload = proposal.model_copy(
+            update={"reference_required": True},
+        ).model_dump(mode="json")
+        return "unrelated", None
     if decision == "decline":
         return finalize("declined", "Okay, I'll leave things as they are.")
     if decision == "revise":
         finalize("superseded")
         return "revised", None
-    if decision == "clarify":
+    if decision in {"conditional", "question"}:
+        finalize("superseded")
+        return decision, None
+    if decision == "clarify" or decision == "confirm" and proposal.reference_required and not explicit_proposal_reference:
         return "confirmation_required", confirmation_prompt(proposal)
     if decision != "confirm":
         return "invalid_decision", None

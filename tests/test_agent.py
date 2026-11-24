@@ -2,6 +2,7 @@ import asyncio
 import json
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
+from uuid import UUID
 
 import pytest
 from agents import RunContextWrapper
@@ -55,12 +56,10 @@ def mock_advisor_runner(monkeypatch, fake_runner):
     monkeypatch.setattr(execution, "run_advisor", run_with_test_key)
 
 
-def structured_output(kind, **fields):
-    return AdvisorOutput.model_validate(dict.fromkeys(AdvisorOutput.model_fields) | {"kind": kind} | fields)
-
-
 async def test_agent_sdk_receives_scoped_context_and_registers_proposal_and_read_tools(monkeypatch, sms_api, sms_data):
-    _, local, foreign, local_customer, _ = sms_data
+    sessions, local, foreign, local_customer, _ = sms_data
+    occurred_at = datetime(2020, 1, 7, 2, tzinfo=UTC)
+    created_at = datetime(2020, 1, 7, 12, tzinfo=UTC)
 
     async def fake_runner(agent, *, input, context, max_turns, run_config):
         assert agent.name == "Service Advisor"
@@ -70,6 +69,7 @@ async def test_agent_sdk_receives_scoped_context_and_registers_proposal_and_read
         assert {tool.name for tool in agent.tools} == {
             "get_customer_vehicles", "get_customer_appointments", "get_appointment_details", "get_available_slots",
             "propose_booking", "propose_reschedule", "propose_cancellation",
+            "get_service_information", "ask_dealership_staff",
         }
         for tool in agent.tools:
             assert not {"tenant_id", "customer_id", "conversation_id"} & tool.params_json_schema["properties"].keys()
@@ -79,6 +79,7 @@ async def test_agent_sdk_receives_scoped_context_and_registers_proposal_and_read
         assert model_input["dealership"]["service_days"] == [0, 1, 2, 3, 4]
         assert model_input["customer"] == {"name": local_customer.name}
         assert model_input["current_inbound_sms"] == "What car do I have on file?"
+        assert model_input["dealership_local_date"] == "2020-01-06"
         assert str(local.id) not in input and str(context.conversation_id) not in input
         assert str(local_customer.id) not in input and foreign.name not in input
         assert local_customer.phone_number not in input
@@ -87,23 +88,34 @@ async def test_agent_sdk_receives_scoped_context_and_registers_proposal_and_read
         wrapper = RunContextWrapper(context)
         wrapper.usage.input_tokens = 20
         wrapper.usage.output_tokens = 8
-        return SimpleNamespace(final_output=structured_output("vehicles"), context_wrapper=wrapper)
+        return SimpleNamespace(final_output=AdvisorOutput(sms="We have a Ford Escape on file."), context_wrapper=wrapper)
 
     mock_advisor_runner(monkeypatch, fake_runner)
     inbound = await simulate(sms_api, body="What car do I have on file?", external_message_id="vehicle")
+    # Simulation timestamps are server assigned. Model an SMS sent before local midnight and stored after it.
+    async with sessions.begin() as session:
+        message = await session.get_one(Message, UUID(inbound["message_id"]))
+        message.occurred_at = occurred_at
+        message.created_at = created_at
     pending = await sms_api.get(agent_path(inbound), headers=LOCAL_HEADERS)
     assert pending.json()["status"] == "pending"
     result = await process(sms_api, inbound)
-    assert result["status"] == "completed" and result["attempts"] == 1
+    assert result["status"] == "completed" and result["attempts"] == 1, result
     assert result["reply"]["body"] == "We have a Ford Escape on file."
     assert result["input_tokens"] == 20 and result["output_tokens"] == 8
     assert result["duration_ms"] >= 0 and result["model"]
     assert result["tool_calls"] == [{"name": "get_customer_vehicles", "outcome": "ok"}]
+    async with sessions() as session:
+        attempt, = (await session.get_one(AgentExecution, UUID(inbound["message_id"]))).advisor_attempts
+    assert attempt["reply_source"] == "model" and attempt["reply_id"] == result["reply"]["id"]
+    assert attempt["tools"] == result["tool_calls"] and attempt["tool_details"] == []
     duplicate = await simulate(sms_api, body="Duplicate delivery", external_message_id="vehicle")
     assert duplicate["status"] == "duplicate"
     assert await process(sms_api, duplicate) == result
     history = await sms_api.get(history_path(inbound), headers=LOCAL_HEADERS)
-    assert [item["direction"] for item in history.json()] == ["inbound", "outbound"]
+    inbound_history, outbound_history = history.json()
+    assert (inbound_history["direction"], outbound_history["direction"]) == ("inbound", "outbound")
+    assert datetime.fromisoformat(inbound_history["occurred_at"]) == occurred_at
     for path in (agent_path(inbound), history_path(inbound)):
         assert (await sms_api.get(path, headers=FOREIGN_HEADERS)).status_code == 404
     assert (await sms_api.post(agent_path(inbound), headers=FOREIGN_HEADERS)).status_code == 404
@@ -145,9 +157,8 @@ async def test_tools_enforce_appointment_and_vehicle_ownership(monkeypatch, sms_
             }
         slots = await invoke(get_available_slots, context, day="2099-01-05", vehicle_id=str(local_appt.vehicle_id))
         assert slots["status"] == "ok" and slots["slots"]
-        assert await invoke(get_available_slots, context, day="2000-01-01", vehicle_id=None) == {
-            "status": "ok", "slots": [], "truncated": False,
-        }
+        past = await invoke(get_available_slots, context, day="2000-01-01")
+        assert past["status"] == "ok" and past["slots"] == [] and past["unavailable_reason"] == "past"
         async def invalid_slot(*args, **kwargs):
             raise InvalidSlot("Internal detail")
 
@@ -214,7 +225,8 @@ async def test_concurrent_inbound_and_processing_preserve_order_and_history(monk
     assert third["conversation_id"] == first["conversation_id"]
     assert (await process(sms_api, second))["status"] == "completed"
     assert inputs[0]["history"] == []
-    assert inputs[1]["history"] == [
+    assert all(item["local_date"] for item in inputs[1]["history"])
+    assert [{key: item[key] for key in ("direction", "body")} for item in inputs[1]["history"]] == [
         {"direction": "inbound", "body": "First question"},
         {"direction": "outbound", "body": "Reply 1"},
     ]

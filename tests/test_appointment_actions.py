@@ -12,15 +12,15 @@ from sqlalchemy import func, select, update
 
 from servicepilot.agent import execution
 from servicepilot.agent.actions import confirmation_prompt, handle_confirmation, lock_conversation
-from servicepilot.agent.advisor import ModelReply
+from servicepilot.agent.advisor import AdvisorOutput, ModelReply, ProposalInformationCheck
 from servicepilot.agent.models import AgentExecution
 from servicepilot.agent.tools import (
-    get_available_slots, get_customer_appointments, interpret_appointment_reply, propose_booking,
+    get_available_slots, get_customer_appointments, get_service_information, interpret_appointment_reply, propose_booking,
     propose_cancellation, propose_reschedule,
 )
 from servicepilot.conversations.pending import pending_proposal
-from servicepilot.db.models import Appointment, Conversation, Customer, Message, Vehicle
-from test_agent import agent_path, history_path, invoke, mock_advisor_runner, process, structured_output
+from servicepilot.db.models import Appointment, Conversation, Customer, Message, Tenant, Vehicle
+from test_agent import agent_path, history_path, invoke, mock_advisor_runner, process
 from test_conversations import (
     AMBIGUOUS_PHONE, FOREIGN_HEADERS, LOCAL_HEADERS, UNKNOWN_PHONE, simulate, sms_api, sms_data,
 )
@@ -79,6 +79,8 @@ async def scenario(monkeypatch, sms_api, sms_data):
         result = await invoke(tool, context, **{
             key: value.isoformat() if isinstance(value, datetime) else value for key, value in kwargs.items()
         })
+        if result["status"] == "identity_required":
+            return ModelReply("Please contact the dealership for help verifying your account.", 2, 2)
         return ModelReply(f"Tool status: {result['status']}", 2, 2)
 
     monkeypatch.setattr(execution, "run_advisor", model)
@@ -114,18 +116,18 @@ async def test_unprepared_confirmation_and_later_agreement_cannot_move_appointme
         assert snapshot["active_confirmation_question"] is None
         assert "interpret_appointment_reply" not in {tool.name for tool in agent.tools}
         if snapshot["current_inbound_sms"] == "Yeah, go ahead.":
-            return sdk_result(context, structured_output("ask_request"))
+            return sdk_result(context, AdvisorOutput(sms="How can I help with your service appointment?"))
         if checked_availability:
             slots = await invoke(get_available_slots, context, day=next_thursday(snapshot).isoformat())
             assert slots["status"] == "ok" and slots["slots"]
-            assert not agent.tool_use_behavior(RunContextWrapper(context), []).is_final_output
+            assert agent.tool_use_behavior == "run_llm_again"
         if structured:
-            return sdk_result(context, structured_output("appointment_action"))
+            return sdk_result(context, AdvisorOutput(sms=None))
         return sdk_result(context, "Should I move your oil change to Thursday at 2?")
 
     mock_advisor_runner(monkeypatch, model)
     receipt, result = await send(sms_api, "Move my oil change to next Thursday at 2.")
-    assert result["reply"]["body"] == execution.UNPREPARED_ACTION_REPLY
+    assert result["reply"] is None and result["error_code"] == "invalid_reply"
     assert result["tool_calls"] == ([{"name": "get_available_slots", "outcome": "ok"}] if checked_availability else [])
     assert await audit(sms_api, receipt) == {"pending": None, "results": []}
     _, agreement = await send(sms_api, "Yeah, go ahead.")
@@ -169,9 +171,8 @@ async def test_natural_reschedule_and_revision_publish_exact_backend_confirmatio
         assert await invoke(propose_reschedule, context, appointment_id=appointment["id"], scheduled_start=slot["start"]) == {
             "status": "proposal_prepared",
         }
-        result = agent.tool_use_behavior(RunContextWrapper(context), [])
-        assert result.is_final_output and result.final_output.kind == "appointment_action"
-        return sdk_result(context, result.final_output if revision else "Should I move your Escape to 7 PM?")
+        assert agent.tool_use_behavior == "run_llm_again"
+        return sdk_result(context, AdvisorOutput(sms="Should I move your Escape to 7 PM?"))
 
     mock_advisor_runner(monkeypatch, model)
     proposals = []
@@ -212,6 +213,43 @@ async def test_failed_proposal_cannot_publish_model_success(monkeypatch, sms_api
         assert await session.scalar(select(Appointment.status).where(Appointment.tenant_id == local.id)) == "scheduled"
 
 
+@pytest.mark.parametrize("safe", [True, False])
+async def test_informational_answer_accompanies_only_the_authoritative_proposal(monkeypatch, sms_api, sms_data, safe):
+    sessions, dealer, _, customer, _ = sms_data
+    async with sessions.begin() as session:
+        tenant = await session.get_one(Tenant, dealer.id)
+        tenant.service_catalog = {"oil change": {"name": "Oil change", "description": "Oil and filter.", "minutes": 30}}
+        original = await session.scalar(select(Appointment).where(Appointment.customer_id == customer.id))
+    draft = "Plan on about half an hour for the oil change." if safe else "I moved your oil change to 7 PM."
+    passes = []
+
+    async def runner(agent, *, input, context, **_):
+        passes.append(agent.output_type)
+        if agent.output_type is ProposalInformationCheck:
+            assert json.loads(input)["information"] == draft
+            assert json.loads(input)["configured_service_durations"]["oil change"][1] == 30
+            return sdk_result(context, ProposalInformationCheck(safe=safe))
+        appointment_id = json.loads(input)["upcoming_appointments"][0]["id"]
+        day = next_thursday(json.loads(input))
+        slot = datetime.combine(day, dealer.opens_at, ZoneInfo(dealer.timezone))
+        assert (await invoke(propose_reschedule, context, appointment_id=appointment_id,
+                             scheduled_start=slot.isoformat()))["status"] == "proposal_prepared"
+        assert (await invoke(get_service_information, context))["services"][0]["duration_minutes"] == 30
+        return sdk_result(context, AdvisorOutput(sms=None, proposal_information=draft, proposal_duration_for="oil change"))
+
+    mock_advisor_runner(monkeypatch, runner)
+    receipt, result = await send(sms_api, "Move my oil change to Thursday at 8. How long does it take?")
+    assert passes == [AdvisorOutput, ProposalInformationCheck]
+    async with sessions() as session:
+        proposal = pending_proposal(await session.get_one(Conversation, UUID(receipt["conversation_id"])))
+        assert str(proposal.prompt_id) == result["reply"]["id"]
+        assert (await session.get_one(Appointment, original.id)).scheduled_start == original.scheduled_start
+    expected = draft if safe else "Oil change typically takes about 30 minutes."
+    assert result["reply"]["body"] == f"{expected} {confirmation_prompt(proposal)}"
+    assert result["reply"]["body"].count("?") == 1
+    assert (await audit(sms_api, receipt))["pending"]["prompt_delivery_status"] == "delivered"
+
+
 @pytest.mark.parametrize("specific_time_unavailable", [False, True])
 async def test_broad_request_or_unavailable_time_offers_actual_slots(
     monkeypatch, sms_api, sms_data, specific_time_unavailable,
@@ -233,7 +271,9 @@ async def test_broad_request_or_unavailable_time_offers_actual_slots(
         assert slots["status"] == "ok"
         hours = [datetime.fromisoformat(slot["start"]).hour for slot in slots["slots"]]
         assert (14 in hours) is not specific_time_unavailable
-        return sdk_result(context, structured_output("availability", day=day, period="afternoon"))
+        times = ", ".join(datetime.fromisoformat(item["start"]).strftime("%I:%M %p").lstrip("0")
+                          for item in slots["slots"][:3])
+        return sdk_result(context, AdvisorOutput(sms=f"I have {times}. Which time works for you?"))
 
     mock_advisor_runner(monkeypatch, model)
     body = (
@@ -256,7 +296,7 @@ async def test_unknown_appointment_prompts_for_clarification(monkeypatch, sms_ap
         assert all(
             datetime.fromisoformat(item["scheduled_start"]).date() != tomorrow for item in appointments["appointments"]
         )
-        return sdk_result(context, structured_output("ask_appointment"))
+        return sdk_result(context, AdvisorOutput(sms="Which appointment do you mean?"))
 
     mock_advisor_runner(monkeypatch, model)
     receipt, result = await send(sms_api, "Cancel my appointment tomorrow.")
@@ -332,6 +372,66 @@ async def test_unclear_reply_repeats_prompt_and_natural_decline_retires_it(sms_a
     assert state["pending"] is None and state["results"][0]["outcome"] == "declined"
     async with sms_data[0]() as session:
         assert (await session.get_one(Appointment, original.id)).status == "scheduled"
+
+
+@pytest.mark.parametrize("deliver_clarification", [True, False])
+async def test_hesitation_preserves_proposal_and_later_assent_requires_clarification_delivery(
+    monkeypatch, sms_api, sms_data, scenario, deliver_clarification,
+):
+    original, start, _, _, _ = scenario
+    sessions = sms_data[0]
+    receipt, _ = await send(sms_api, "Move my oil change")
+    initial = (await audit(sms_api, receipt))["pending"]
+    clarification = "Take your time. Let me know if you'd like me to move it."
+    calls = []
+
+    async def model(_, context, model_input):
+        data = json.loads(model_input)
+        calls.append(data["current_inbound_sms"])
+        if len(calls) == 1:
+            await invoke(interpret_appointment_reply, context, decision="clarify", clarification_sms=clarification)
+        else:
+            assert data["active_confirmation_question"] == clarification
+            await invoke(interpret_appointment_reply, context, decision="confirm")
+        return ModelReply(None, 1, 1)
+
+    monkeypatch.setattr(execution, "run_advisor", model)
+    with monkeypatch.context() as patch:
+        if not deliver_clarification:
+            async def hold_delivery(*args, **kwargs):
+                return False
+
+            patch.setattr("servicepilot.conversations.routes.deliver_next", hold_delivery)
+        _, clarified = await send(sms_api, "umm maybe, give me a bit")
+    assert clarified["reply"]["body"] == clarification
+    assert clarified["confirmation_attempts"][0]["action_outcome"] == "confirmation_required"
+    state = await audit(sms_api, receipt)
+    refreshed = state["pending"]
+    assert refreshed["proposal"] == {**initial["proposal"], "prompt_id": clarified["reply"]["id"]}
+    assert refreshed["expires_at"] == initial["expires_at"]
+    assert refreshed["prompt_delivery_status"] == ("delivered" if deliver_clarification else "pending")
+    assert not state["results"]
+    async with sessions() as session:
+        conversation = await session.get_one(Conversation, UUID(receipt["conversation_id"]))
+        assert conversation.conditional_request is None
+        assert (await session.get_one(Appointment, original.id)).scheduled_start == original.scheduled_start
+
+    _, agreed = await send(sms_api, "Yes, please move it.")
+    diagnostic, = agreed["confirmation_attempts"]
+    assert diagnostic["prompt_id"] == clarified["reply"]["id"]
+    state = await audit(sms_api, receipt)
+    assert state["pending"] is None
+    if deliver_clarification:
+        assert calls == ["umm maybe, give me a bit", "Yes, please move it."]
+        assert diagnostic["action_outcome"] == "succeeded"
+        assert state["results"][0]["appointment_id"] == str(original.id)
+    else:
+        assert calls == ["umm maybe, give me a bit"]
+        assert diagnostic["action_outcome"] == "delivery_unverified"
+        assert state["results"][0]["outcome"] == "superseded"
+    async with sessions() as session:
+        expected_start = start if deliver_clarification else original.scheduled_start
+        assert (await session.get_one(Appointment, original.id)).scheduled_start == expected_start
 
 
 @pytest.mark.parametrize("failure", ["missing", "invalid", "duplicate", "tool_error", "refused"])
@@ -458,8 +558,15 @@ async def test_model_decision_cannot_authorize_a_changed_proposal(monkeypatch, s
     async def replace_during_model_call(settings, context, model_input):
         assert str(context.pending.id) == proposal_id
         assert proposal_id not in model_input
-        assert set(interpret_appointment_reply.params_json_schema["properties"]) == {"decision"}
-        await invoke(interpret_appointment_reply, context, decision="confirm")
+        schema = interpret_appointment_reply.params_json_schema
+        assert set(schema["properties"]) == set(schema["required"]) == {
+            "decision", "condition", "clarification_sms", "explicit_proposal_reference",
+        }
+        assert schema["additionalProperties"] is False
+        assert await invoke(
+            interpret_appointment_reply, context, decision="confirm", condition=None, clarification_sms=None,
+            explicit_proposal_reference=False,
+        ) == "intent_recorded"
         async with sms_data[0].begin() as session:
             conversation = await session.get_one(Conversation, UUID(receipt["conversation_id"]))
             conversation.pending_action_payload = {**conversation.pending_action_payload, change: changed_value}
@@ -467,7 +574,8 @@ async def test_model_decision_cannot_authorize_a_changed_proposal(monkeypatch, s
 
     monkeypatch.setattr(execution, "run_advisor", replace_during_model_call)
     _, result = await send(sms_api, "Yeah, go ahead.")
-    assert result["tool_calls"][0]["outcome"] == "stale_confirmation"
+    assert result["status"] == "completed", result
+    assert result["tool_calls"] == [{"name": "appointment_confirmation", "outcome": "stale_confirmation"}]
     diagnostic, = result["confirmation_attempts"]
     assert diagnostic["decision"] == "confirm" and diagnostic["authorization"] == "rejected"
     assert diagnostic["proposal_id"] == proposal_id

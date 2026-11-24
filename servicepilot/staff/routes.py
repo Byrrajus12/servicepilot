@@ -12,13 +12,16 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from servicepilot.agent.actions import lock_conversation
+from servicepilot.agent.models import AgentExecution
 from servicepilot.conversations.context import build_context
 from servicepilot.conversations.models import Conversation, Message
+from servicepilot.conversations.pending import retire_pending
+from servicepilot.sms.fence import lock_ownership_change
 from servicepilot.sms.models import SMSDelivery
 from servicepilot.staff.auth import (
     EmployeeTransaction, hash_password, new_session, password_jobs, password_matches, unauthorized,
 )
-from servicepilot.staff.consultations import thread_consultations
+from servicepilot.staff.consultations import cancel_consultations, enqueue_answer, thread_consultations
 from servicepilot.staff.models import Consultation, Employee, EmployeeRole, EmployeeSession, OwnershipEvent, StaffNote
 from servicepilot.tenancy.models import Tenant
 
@@ -67,12 +70,18 @@ class EmployeeState(Input):
 class Assign(Input):
     employee_id: UUID | None
 
+class Ownership(Input):
+    expected_version: int = Field(ge=0)
+
 class Note(Input):
     body: MessageText
 
 
 class InternalNote(Note):
     reply_to_id: UUID | None = None
+
+class Answer(Input):
+    public_fact: ShortText
 
 class ServiceInformation(Input):
     name: Annotated[ShortText, Field(max_length=120)]
@@ -115,6 +124,12 @@ def conversation_view(conversation: Conversation, waiting: bool) -> dict:
 
 def record_view(item, fields: str) -> dict:
     return {key: getattr(item, key) for key in ("id", "created_at", *fields.split())}
+
+def consultation_view(consultation: Consultation) -> dict:
+    return record_view(
+        consultation, "conversation_id execution_id inbound_id question status assigned_id public_fact "
+        "answered_by answered_at resolved_at updated_at",
+    )
 
 def require_manager(employee: Employee) -> None:
     if employee.role != "manager":
@@ -307,6 +322,66 @@ async def add_note(conversation_id: UUID, body: InternalNote, tx: EmployeeTransa
     await session.flush()
     return record_view(note, "employee_id body reply_to_id")
 
+@router.get("/consultations")
+async def consultations(
+    tx: EmployeeTransaction, page: Pagination, conversation_id: UUID | None = None,
+    status: Literal["open", "answered", "resolved", "canceled"] | None = None,
+) -> list[dict]:
+    session, employee, _ = tx
+    query = select(Consultation).where(Consultation.tenant_id == employee.tenant_id)
+    if conversation_id is not None:
+        await get_thread(session, employee, conversation_id)
+        query = query.where(Consultation.conversation_id == conversation_id)
+    if status is not None:
+        query = query.where(Consultation.status == status)
+    rows = await session.scalars(query.order_by(
+        Consultation.created_at.desc(), Consultation.id.desc(),
+    ).offset(page.offset).limit(page.limit))
+    return [consultation_view(row) for row in rows]
+
+
+async def consultation_for_staff(
+    session: AsyncSession, employee: Employee, conversation_id: UUID, consultation_id: UUID,
+) -> tuple[Conversation, Consultation]:
+    conversation = await get_thread(session, employee, conversation_id, write=True)
+    consultation = await session.scalar(select(Consultation).where(
+        *thread_consultations(conversation), Consultation.id == consultation_id,
+    ))
+    if consultation is None:
+        raise HTTPException(404, "Consultation not found")
+    require_assignment(employee, consultation.assigned_id)
+    return conversation, consultation
+
+
+@router.put("/conversations/{conversation_id}/consultations/{consultation_id}/answer")
+async def answer(conversation_id: UUID, consultation_id: UUID, body: Answer, tx: EmployeeTransaction) -> dict:
+    session, employee, _ = tx
+    conversation, consultation = await consultation_for_staff(session, employee, conversation_id, consultation_id)
+    if consultation.answered_by == employee.id and consultation.public_fact == body.public_fact:
+        return consultation_view(consultation)
+    if (
+        consultation.status != "open" or conversation.owner != "ai"
+        or conversation.ownership_version != consultation.ownership_version
+    ):
+        raise HTTPException(409, "Consultation is no longer open")
+    now = await session.scalar(select(func.clock_timestamp()))
+    await enqueue_answer(session, consultation, employee.id, body.public_fact, now)
+    await session.flush()
+    return consultation_view(consultation)
+
+
+@router.put("/conversations/{conversation_id}/consultations/{consultation_id}/cancel")
+async def cancel(conversation_id: UUID, consultation_id: UUID, tx: EmployeeTransaction) -> dict:
+    session, employee, _ = tx
+    _, consultation = await consultation_for_staff(session, employee, conversation_id, consultation_id)
+    if consultation.status == "resolved":
+        raise HTTPException(409, "Consultation already resolved")
+    if consultation.status != "canceled":
+        now = await session.scalar(select(func.clock_timestamp()))
+        consultation.status = "canceled"
+        consultation.resolved_at = consultation.updated_at = now
+    return consultation_view(consultation)
+
 @router.get("/conversations/{conversation_id}/ownership-events")
 async def ownership_events(conversation_id: UUID, tx: EmployeeTransaction, page: Pagination) -> list[dict]:
     session, employee, _ = tx
@@ -347,4 +422,53 @@ async def assign(conversation_id: UUID, body: Assign, tx: EmployeeTransaction) -
         *thread_consultations(conversation), Consultation.status == "open",
     ).values(assigned_id=body.employee_id))
     audit_owner(session, conversation, employee, conversation.owner)
+    return await view_thread(session, conversation)
+
+def unfinished_work(conversation: Conversation):
+    return update(AgentExecution).where(
+        AgentExecution.tenant_id == conversation.tenant_id, AgentExecution.conversation_id == conversation.id,
+        (AgentExecution.status.in_(("pending", "running")) | AgentExecution.next_attempt_at.is_not(None)),
+    )
+
+
+@router.put("/conversations/{conversation_id}/ownership/{owner}")
+async def set_ownership(
+    conversation_id: UUID, owner: Literal["ai", "human"], body: Ownership, tx: EmployeeTransaction,
+) -> dict:
+    session, employee, _ = tx
+    await lock_ownership_change(session, employee.tenant_id, conversation_id)
+    conversation = await get_thread(session, employee, conversation_id, write=True)
+    require_assignment(employee, conversation.assigned_employee_id)
+    if body.expected_version != conversation.ownership_version:
+        raise HTTPException(409, "Ownership changed")
+    if owner == conversation.owner:
+        return await view_thread(session, conversation)
+    previous = conversation.owner
+    now = await session.scalar(select(func.clock_timestamp()))
+    conversation.owner = owner
+    conversation.ownership_version += 1
+    conversation.updated_at = now
+    if owner == "human":
+        conversation.assigned_employee_id = employee.id
+        retire_pending(session, conversation, "superseded")
+        conversation.conditional_request = None
+        await cancel_consultations(session, conversation, now)
+        # Work with a reply that never reached a transport is still unanswered.
+        # Keep its archived outbox row fenced with the previous ownership version.
+        never_submitted = exists().where(
+            SMSDelivery.id == AgentExecution.reply_id, SMSDelivery.tenant_id == employee.tenant_id,
+            SMSDelivery.conversation_id == conversation.id, SMSDelivery.status.in_(("pending", "sending")),
+            SMSDelivery.submission_started.is_(False),
+        )
+        await session.execute(update(AgentExecution).where(
+            AgentExecution.tenant_id == employee.tenant_id, AgentExecution.conversation_id == conversation.id,
+            AgentExecution.status == "completed", AgentExecution.resume_source_id.is_(None), never_submitted,
+        ).values(status="pending", reply_id=None, error_code=None))
+        await session.execute(unfinished_work(conversation).where(
+            AgentExecution.resume_source_id.is_not(None),
+        ).values(status="failed", next_attempt_at=None, lease_expires_at=None, error_code="ownership_changed"))
+        await session.execute(unfinished_work(conversation).where(
+            AgentExecution.resume_source_id.is_(None),
+        ).values(status="pending", next_attempt_at=None, lease_expires_at=None, error_code=None))
+    audit_owner(session, conversation, employee, previous)
     return await view_thread(session, conversation)

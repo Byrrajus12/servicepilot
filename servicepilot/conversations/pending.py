@@ -14,7 +14,7 @@ from servicepilot.conversations.models import Conversation
 from servicepilot.db.base import Base, TenantOwned
 
 ActionType = Literal["book", "reschedule", "cancel"]
-ProposalDecision = Literal["confirm", "decline", "revise", "clarify"]
+ProposalDecision = Literal["confirm", "decline", "revise", "clarify", "conditional", "question", "unrelated"]
 ActionOutcome = Literal[
     "succeeded", "unavailable", "appointment_changed", "declined", "expired",
     "superseded", "identity_required",
@@ -42,6 +42,16 @@ class PublishedProposal(Proposal):
     request_id: UUID
     prompt_id: UUID
     published_at: AwareDatetime
+    reference_required: bool = False
+
+
+class ConditionalRequest(BaseModel):
+    request_id: UUID
+    customer_id: UUID | None
+    request: str
+    condition: str
+    proposal: Proposal | None = None
+    evidence: str | None = None
 
 
 class AppointmentActionResult(TenantOwned, Base):

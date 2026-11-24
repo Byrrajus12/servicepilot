@@ -2,7 +2,7 @@ from datetime import UTC, datetime, time
 from typing import Literal
 from uuid import UUID
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, JsonValue
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, JsonValue
 from sqlalchemy import exists, or_, select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -27,6 +27,7 @@ class DealershipContext(BaseModel):
     opens_at: time
     closes_at: time
     appointment_minutes: int
+    service_ids: list[str] = Field(default_factory=list, exclude=True)
 
 
 class PendingActionContext(BaseModel):
@@ -107,12 +108,15 @@ async def build_context(
     appointments = await dms.upcoming(customer.id, now) if customer is not None else []
     newest = await read_history(
         session, tenant_id, conversation_id, history_limit, before_inbound=before_inbound,
+        ownership_version=conversation.ownership_version,
     )
     if before_inbound is not None and customer is None and conversation.customer_id is not None:
         newest = []
     return ConversationContext(
         operations=ConversationOperations(
-            dealership=DealershipContext.model_validate(dealership),
+            dealership=DealershipContext.model_validate(dealership).model_copy(
+                update={"service_ids": list(dealership.service_catalog)},
+            ),
             conversation_id=conversation.id,
             status=conversation.status,
             customer_resolution=resolution,
@@ -143,13 +147,20 @@ async def current_identity(
 
 async def read_history(
     session: AsyncSession, tenant_id: UUID, conversation_id: UUID, history_limit: int,
-    *, before_inbound: Message | None = None,
+    *, before_inbound: Message | None = None, ownership_version: int = 0,
 ) -> list[HistoryMessage]:
     query = select(Message).where(
         Message.tenant_id == tenant_id, Message.conversation_id == conversation_id,
     )
     if before_inbound is not None:
-        outbound = Message.direction == "outbound"
+        outbound = (Message.direction == "outbound") & ~exists(select(SMSDelivery.id).where(
+            SMSDelivery.id == Message.id,
+            or_(
+                SMSDelivery.error_code.in_(("ownership_changed", "ownership_or_lease_changed", "consultation_superseded")),
+                SMSDelivery.status.in_(("pending", "sending")) & (SMSDelivery.ai_ownership_version != ownership_version),
+                SMSDelivery.inbound_guard_id.is_not(None) & (SMSDelivery.status != "delivered"),
+            ),
+        ))
         if before_inbound.provider.startswith("twilio-"):
             outbound = outbound & exists(select(SMSDelivery.id).where(
                 SMSDelivery.id == Message.id, SMSDelivery.tenant_id == Message.tenant_id,
