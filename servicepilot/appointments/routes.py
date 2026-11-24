@@ -58,8 +58,9 @@ async def upcoming_appointments(customer_id: UUID, service: Service):
 @router.get("/availability", response_model=list[SlotResponse])
 async def availability(
     day: Annotated[date, Query(alias="date")], service: Service, vehicle_id: UUID | None = None,
+    service_type: Annotated[str | None, Query(min_length=1, max_length=120)] = None,
 ):
-    return await service.availability(day, vehicle_id)
+    return await service.availability(day, vehicle_id, service_type=service_type)
 
 
 @router.get("/appointments/{appointment_id}", response_model=AppointmentResponse)

@@ -62,7 +62,7 @@ async def prepare_proposal(
     if vehicle is None or vehicle.customer_id != customer_id:
         raise RecordNotFound
     if scheduled_start is not None:
-        await service.check_slot(scheduled_start, vehicle_id, appointment_id)
+        await service.check_slot(scheduled_start, vehicle_id, appointment_id, service_type=service_type)
     return Proposal(
         id=uuid4(), kind=kind, customer_id=customer_id, vehicle_id=vehicle_id,
         vehicle_label=f"{vehicle.model_year} {vehicle.make} {vehicle.model}", dealership=dealer.name,
