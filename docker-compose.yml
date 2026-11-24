@@ -17,7 +17,7 @@ services:
 
   api:
     build: .
-    environment:
+    environment: &servicepilot_environment
       DATABASE_URL: ${COMPOSE_DATABASE_URL:-postgresql+asyncpg://servicepilot@db:5432/servicepilot}
       PGPASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
       DEALERSHIP_API_KEYS: ${DEALERSHIP_API_KEYS:-}
@@ -26,11 +26,48 @@ services:
       AGENT_MODEL: ${AGENT_MODEL:-}
       AGENT_TIMEOUT_SECONDS: ${AGENT_TIMEOUT_SECONDS:-}
       AGENT_MAX_TURNS: ${AGENT_MAX_TURNS:-}
+      AGENT_MAX_ATTEMPTS: ${AGENT_MAX_ATTEMPTS:-}
+      WORKER_POLL_SECONDS: ${WORKER_POLL_SECONDS:-}
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-}
+      WORKER_RETRY_BASE_SECONDS: ${WORKER_RETRY_BASE_SECONDS:-}
+      SMS_DELIVERY_MAX_ATTEMPTS: ${SMS_DELIVERY_MAX_ATTEMPTS:-}
+      SMS_MESSAGES_PER_MINUTE: ${SMS_MESSAGES_PER_MINUTE:-}
+      SMS_TRANSPORT: ${SMS_TRANSPORT:-simulation}
+      TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID:-}
+      TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN:-}
+      TWILIO_NUMBER_ROUTES: ${TWILIO_NUMBER_ROUTES:-}
+      SMS_PUBLIC_WEBHOOK_BASE_URL: ${SMS_PUBLIC_WEBHOOK_BASE_URL:-}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:8000:8000"
+
+  migrate:
+    build: .
+    environment:
+      DATABASE_URL: ${COMPOSE_DATABASE_URL:-postgresql+asyncpg://servicepilot@db:5432/servicepilot}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+    command: ["alembic", "upgrade", "head"]
     depends_on:
       db:
         condition: service_healthy
-    ports:
-      - "127.0.0.1:8000:8000"
+
+  worker:
+    build: .
+    environment: *servicepilot_environment
+    command: ["python", "-m", "servicepilot.worker"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    stop_grace_period: 155s
+    healthcheck:
+      test: ["CMD", "python", "-m", "servicepilot.worker", "--health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
 
   tests:
     profiles: ["test"]
