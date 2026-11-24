@@ -1,17 +1,20 @@
 from collections.abc import AsyncIterator
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 import pytest_asyncio
 from alembic import command
 from alembic.config import Config
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy import delete
 from sqlalchemy.engine import Connection
-from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
 from servicepilot.config import Settings
+from servicepilot.db.models import Tenant
+from servicepilot.db.session import build_session_factory
 from servicepilot.seed import seed_database
 
 
@@ -57,6 +60,25 @@ async def migrated_database(database_settings: Settings) -> AsyncIterator[AsyncE
                 await connection.exec_driver_sql(f'DROP SCHEMA "{schema}" CASCADE')
     finally:
         await admin_engine.dispose()
+
+
+@pytest_asyncio.fixture
+async def committed_tenants(
+    migrated_database: AsyncEngine,
+) -> AsyncIterator[tuple[async_sessionmaker[AsyncSession], list[UUID]]]:
+    sessions = build_session_factory(migrated_database)
+    tenant_ids: list[UUID] = []
+    try:
+        yield sessions, tenant_ids
+    finally:
+        if tenant_ids:
+            async with sessions.begin() as session:
+                # Committed test data is visible to other connections. Delete FK dependents
+                # first, including deliveries that refer to a separate confirmation prompt.
+                for table in reversed(Tenant.metadata.sorted_tables):
+                    if "tenant_id" in table.c:
+                        await session.execute(delete(table).where(table.c.tenant_id.in_(tenant_ids)))
+                await session.execute(delete(Tenant).where(Tenant.id.in_(tenant_ids)))
 
 
 @pytest_asyncio.fixture

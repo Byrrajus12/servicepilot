@@ -62,8 +62,8 @@ async def scenario(monkeypatch, sms_api, sms_data):
     async def model(settings, context, model_input):
         data = json.loads(model_input)
         body = data["current_inbound_sms"]
-        if data["active_confirmation_question"] and body != "Unclassified":
-            if body in {"Yeah, go ahead.", "Yes, please.", "Book it", "Please cancel it", "Sounds good."}:
+        if data["active_confirmation_question"]:
+            if body in {"ye go ahead", "Yeah, go ahead.", "Yes, please.", "Book it", "Please cancel it", "Sounds good."}:
                 decision = "confirm"
             elif body == "No, thanks.":
                 decision = "decline"
@@ -71,7 +71,8 @@ async def scenario(monkeypatch, sms_api, sms_data):
                 decision = "revise"
             else:
                 decision = "clarify"
-            assert await invoke(interpret_appointment_reply, context, decision=decision) == {"status": "intent_recorded"}
+            assert await invoke(interpret_appointment_reply, context, decision=decision) == "intent_recorded"
+            return ModelReply(None, 2, 2)
         if body not in requests:
             return ModelReply("What would you like to change?", 2, 2)
         tool, kwargs = requests[body]
@@ -92,7 +93,7 @@ async def send(api, body):
 
 
 def sdk_result(context, output):
-    return SimpleNamespace(final_output=output, context_wrapper=RunContextWrapper(context))
+    return SimpleNamespace(final_output=output, context_wrapper=RunContextWrapper(context), raw_responses=[])
 
 
 def next_thursday(snapshot):
@@ -143,15 +144,19 @@ async def test_natural_reschedule_and_revision_publish_exact_backend_confirmatio
         snapshot = json.loads(input)
         body = snapshot["current_inbound_sms"]
         if body == "Yeah, go ahead.":
-            await invoke(interpret_appointment_reply, context, decision="confirm")
-            return sdk_result(context, "Done, moved to 7 PM.")
+            return sdk_result(context, await invoke(interpret_appointment_reply, context, decision="confirm"))
         revision = body == "Actually, make it 3 instead."
         appointment = snapshot["upcoming_appointments"][0]
-        if revision:
+        if revision and context.pending is not None:
             assert snapshot["active_proposal"]["appointment_id"] == appointment["id"]
             assert snapshot["active_confirmation_question"]
             assert snapshot["history"][-1]["body"] == snapshot["active_confirmation_question"]
-            await invoke(interpret_appointment_reply, context, decision="revise")
+            return sdk_result(context, await invoke(interpret_appointment_reply, context, decision="revise"))
+        if revision:
+            assert snapshot["revision_of"]["appointment_id"] == appointment["id"]
+            assert snapshot["active_proposal"] is None
+            assert agent.model_settings.tool_choice is None
+            assert interpret_appointment_reply not in agent.tools
         else:
             assert body == "Move my oil change to next Thursday at 2."
             assert snapshot["active_proposal"] is None
@@ -311,18 +316,105 @@ async def test_multi_turn_booking_rescheduling_and_cancellation(sms_api, sms_dat
 async def test_unclear_reply_repeats_prompt_and_natural_decline_retires_it(sms_api, sms_data, scenario):
     original, _, _, _, _ = scenario
     receipt, proposed = await send(sms_api, "Cancel my oil change")
-    for text in ("Maybe", "Wait, which appointment?", "Yes, if it's free", "Yes. No, hold on.", "Unclassified"):
+    for text in ("Maybe", "Wait, which appointment?", "Yes, if it's free", "Yes. No, hold on."):
         _, result = await send(sms_api, text)
         assert result["reply"]["body"] == proposed["reply"]["body"]
         assert result["tool_calls"][0]["outcome"] == "confirmation_required"
+        diagnostic, = result["confirmation_attempts"]
+        assert diagnostic["interpretation"] == "decided" and diagnostic["decision"] == "clarify"
+        assert diagnostic["authorization"] == "accepted" and diagnostic["error_code"] is None
     _, declined = await send(sms_api, "No, thanks.")
     assert declined["tool_calls"][0]["outcome"] == "declined"
+    assert declined["confirmation_attempts"][0]["decision"] == "decline"
     _, stale = await send(sms_api, "Yes, please.")
     assert stale["tool_calls"] == []
     state = await audit(sms_api, receipt)
     assert state["pending"] is None and state["results"][0]["outcome"] == "declined"
     async with sms_data[0]() as session:
         assert (await session.get_one(Appointment, original.id)).status == "scheduled"
+
+
+@pytest.mark.parametrize("failure", ["missing", "invalid", "duplicate", "tool_error", "refused"])
+async def test_confirmation_contract_failures_never_publish_or_mutate(
+    monkeypatch, sms_api, sms_data, scenario, failure,
+):
+    original, start, *_ = scenario
+    proposal_receipt, proposed = await send(sms_api, "Move my oil change")
+    proposal_id = (await audit(sms_api, proposal_receipt))["pending"]["proposal"]["id"]
+    valid_model = execution.run_advisor
+
+    async def failed_model(settings, context, model_input):
+        if failure == "invalid":
+            await invoke(interpret_appointment_reply, context, decision="maybe")
+        elif failure == "duplicate":
+            await invoke(interpret_appointment_reply, context, decision="confirm")
+            await invoke(interpret_appointment_reply, context, decision="decline")
+        elif failure in ("tool_error", "refused"):
+            context.confirmation.interpretation = failure
+            if failure == "tool_error":
+                raise RuntimeError("fixture tool failure")
+        return ModelReply("The appointment is moved.", 2, 2)
+
+    monkeypatch.setattr(execution, "run_advisor", failed_model)
+    receipt, failed = await send(sms_api, "ye go ahead")
+    assert failed["status"] == "failed" and failed["reply"] is None
+    assert failed["error_code"] == f"confirmation_{failure}"
+    assert (failed["next_attempt_at"] is not None) == (failure != "refused")
+    diagnostic, = failed["confirmation_attempts"]
+    assert diagnostic["attempt"] == 1 and diagnostic["interpretation"] == failure
+    assert diagnostic["decision"] is None and diagnostic["authorization"] is None
+    assert diagnostic["proposal_id"] == proposal_id and diagnostic["prompt_id"] == proposed["reply"]["id"]
+    assert diagnostic["error_code"] == failed["error_code"]
+    assert (await audit(sms_api, receipt))["results"] == []
+    async with sms_data[0]() as session:
+        assert (await session.get_one(Appointment, original.id)).scheduled_start == original.scheduled_start
+
+    monkeypatch.setattr(execution, "run_advisor", valid_model)
+    retried = await process(sms_api, receipt)
+    if failure == "refused":
+        assert retried["confirmation_attempts"] == [diagnostic]
+    else:
+        failed_attempt, confirmed = retried["confirmation_attempts"]
+        assert failed_attempt == diagnostic
+        assert confirmed["attempt"] == 2 and confirmed["decision"] == "confirm"
+        assert confirmed["authorization"] == "accepted" and confirmed["action_outcome"] == "succeeded"
+        assert retried["status"] == "completed"
+        async with sms_data[0]() as session:
+            assert (await session.get_one(Appointment, original.id)).scheduled_start == start
+
+
+async def test_revision_retry_reuses_retired_proposal_without_reinterpreting(monkeypatch, sms_api, sms_data, scenario):
+    original, _, later, *_ = scenario
+    receipt, _ = await send(sms_api, "Move my oil change")
+    old_id = (await audit(sms_api, receipt))["pending"]["proposal"]["id"]
+    model = execution.run_advisor
+
+    async def interrupt_revision(settings, context, model_input):
+        if json.loads(model_input)["revision_of"] is not None:
+            raise TimeoutError
+        return await model(settings, context, model_input)
+
+    monkeypatch.setattr(execution, "run_advisor", interrupt_revision)
+    revision_receipt, interrupted = await send(sms_api, "Yes, but make it an hour later.")
+    assert interrupted["status"] == "failed" and interrupted["error_code"] == "timeout"
+    assert interrupted["confirmation_attempts"][0]["decision"] == "revise"
+    state = await audit(sms_api, receipt)
+    assert state["pending"] is None and state["results"][0]["proposal"]["id"] == old_id
+
+    async def resume_revision(settings, context, model_input):
+        assert context.pending is None
+        assert json.loads(model_input)["revision_of"]["appointment_id"] == str(original.id)
+        return await model(settings, context, model_input)
+
+    monkeypatch.setattr(execution, "run_advisor", resume_revision)
+    resumed = await process(sms_api, revision_receipt)
+    assert resumed["status"] == "completed"
+    assert resumed["confirmation_attempts"][1]["interpretation"] == "recovered"
+    state = await audit(sms_api, receipt)
+    assert state["pending"]["proposal"]["id"] != old_id
+    assert datetime.fromisoformat(state["pending"]["proposal"]["scheduled_start"]) == later
+    async with sms_data[0]() as session:
+        assert (await session.get_one(Appointment, original.id)).scheduled_start == original.scheduled_start
 
 
 async def test_revision_invalidates_old_proposal_even_if_referenced_after_new_prompt(sms_api, sms_data, scenario):
@@ -334,6 +426,7 @@ async def test_revision_invalidates_old_proposal_even_if_referenced_after_new_pr
     assert (await audit(sms_api, receipt))["pending"]["proposal"]["id"] != prior
     _, rejected = await send(sms_api, "Yes, the first time you suggested")
     assert rejected["tool_calls"][0]["outcome"] == "confirmation_required"
+    assert rejected["confirmation_attempts"][0]["decision"] == "clarify"
     saved = (await audit(sms_api, receipt))["results"][0]
     assert saved["outcome"] == "superseded" and saved["proposal"]["id"] == prior
     async with sms_data[0]() as session:
@@ -375,11 +468,37 @@ async def test_model_decision_cannot_authorize_a_changed_proposal(monkeypatch, s
     monkeypatch.setattr(execution, "run_advisor", replace_during_model_call)
     _, result = await send(sms_api, "Yeah, go ahead.")
     assert result["tool_calls"][0]["outcome"] == "stale_confirmation"
+    diagnostic, = result["confirmation_attempts"]
+    assert diagnostic["decision"] == "confirm" and diagnostic["authorization"] == "rejected"
+    assert diagnostic["proposal_id"] == proposal_id
     assert result["reply"]["body"] == "Please reply to the latest appointment confirmation text."
     state = await audit(sms_api, receipt)
     assert state["pending"]["proposal"][change] == changed_value and state["results"] == []
     async with sms_data[0]() as session:
         assert (await session.get_one(Appointment, original.id)).scheduled_start == original.scheduled_start
+
+
+async def test_confirm_is_rejected_if_identity_changes_during_interpretation(
+    monkeypatch, sms_api, sms_data, scenario,
+):
+    original, *_ = scenario
+    sessions, local, _, customer, _ = sms_data
+    await send(sms_api, "Cancel my oil change")
+
+    async def confirm_after_identity_change(settings, context, model_input):
+        await invoke(interpret_appointment_reply, context, decision="confirm")
+        async with sessions.begin() as session:
+            session.add(Customer(tenant_id=local.id, name="New ambiguity", phone_number=customer.phone_number))
+        return ModelReply(None, 2, 2)
+
+    monkeypatch.setattr(execution, "run_advisor", confirm_after_identity_change)
+    _, result = await send(sms_api, "ye go ahead")
+    diagnostic, = result["confirmation_attempts"]
+    assert diagnostic["decision"] == "confirm" and diagnostic["authorization"] == "rejected"
+    assert diagnostic["action_outcome"] == "identity_required"
+    assert result["error_code"] == "identity_changed" and result["reply"] is None
+    async with sessions() as session:
+        assert (await session.get_one(Appointment, original.id)).status == "scheduled"
 
 
 async def test_expired_proposal_never_mutates(sms_api, sms_data, scenario):
@@ -389,7 +508,10 @@ async def test_expired_proposal_never_mutates(sms_api, sms_data, scenario):
         await session.execute(update(Conversation).where(Conversation.id == UUID(receipt["conversation_id"])).values({
             "pending_action_expires_at": datetime.now(UTC) - timedelta(seconds=1),
         }))
-    await send(sms_api, "Yes, please.")
+    _, result = await send(sms_api, "Yes, please.")
+    diagnostic, = result["confirmation_attempts"]
+    assert diagnostic["interpretation"] == "not_run"
+    assert diagnostic["authorization"] == "rejected" and diagnostic["action_outcome"] == "expired"
     state = await audit(sms_api, receipt)
     assert state["pending"] is None
     assert state["results"][0]["outcome"] == "expired"
@@ -446,6 +568,9 @@ async def test_retry_recovers_committed_mutation_after_crash_before_outbound(mon
     monkeypatch.setattr(execution, "run_advisor", crash)
     retried = await process(sms_api, inbound)
     assert retried["attempts"] == 2 and "moved to" in retried["reply"]["body"]
+    first, recovered = retried["confirmation_attempts"]
+    assert (first["decision"], first["action_outcome"]) == ("confirm", "succeeded")
+    assert (recovered["interpretation"], recovered["action_outcome"]) == ("recovered", "succeeded")
     async with sessions() as session:
         moved = await session.get_one(Appointment, original.id)
         assert moved.updated_at == version
@@ -537,6 +662,9 @@ async def test_revalidation_blocks_stale_identity_and_foreign_or_unowned_appoint
         session.add(Customer(tenant_id=local.id, name="New ambiguity", phone_number=customer.phone_number))
     result = await process(sms_api, inbound)
     assert result["tool_calls"][0]["outcome"] == "identity_required"
+    diagnostic, = result["confirmation_attempts"]
+    assert diagnostic["interpretation"] == "not_run"
+    assert diagnostic["authorization"] == "rejected" and diagnostic["action_outcome"] == "identity_required"
     assert (await audit(sms_api, receipt))["results"][0]["outcome"] == "identity_required"
     async with sessions() as session:
         assert (await session.get_one(Appointment, original.id)).status == "scheduled"

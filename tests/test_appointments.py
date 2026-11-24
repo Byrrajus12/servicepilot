@@ -5,12 +5,11 @@ from zoneinfo import ZoneInfo
 
 import pytest
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import delete, func, select, text, update
+from sqlalchemy import func, select, text, update
 
 from servicepilot.appointments.service import AppointmentConflict, AppointmentService
 from servicepilot.config import Settings
 from servicepilot.db.models import Appointment, Customer, Tenant, Vehicle
-from servicepilot.db.session import build_session_factory
 from servicepilot.integrations.mock_dms import MockDMSAdapter
 from servicepilot.main import create_app
 from servicepilot.seed import seed_database
@@ -20,12 +19,13 @@ OTHER_HEADERS = {"X-API-Key": "test-harbor-point-key"}
 
 
 @pytest.fixture
-async def dealership_data(migrated_database):
-    sessions = build_session_factory(migrated_database)
+async def dealership_data(committed_tenants):
+    sessions, tenant_ids = committed_tenants
     async with sessions.begin() as session:
         await seed_database(session)
         dealers = (await session.scalars(select(Tenant).order_by(Tenant.slug))).all()
         local, other = dealers
+        tenant_ids.extend((local.id, other.id))
         local.timezone = "Asia/Tokyo"
         local.opens_at = time(8)
         local.closes_at = time(10, 15)
@@ -39,14 +39,7 @@ async def dealership_data(migrated_database):
                 .order_by(Appointment.external_dms_id)
             )).all()
 
-    try:
-        yield sessions, local, other, visits[local.slug], visits[other.slug]
-    finally:
-        async with sessions.begin() as session:
-            tenant_ids = [dealer.id for dealer in dealers]
-            for model in (Appointment, Vehicle, Customer):
-                await session.execute(delete(model).where(model.tenant_id.in_(tenant_ids)))
-            await session.execute(delete(Tenant).where(Tenant.id.in_(tenant_ids)))
+    return sessions, local, other, visits[local.slug], visits[other.slug]
 
 
 @pytest.fixture

@@ -4,17 +4,14 @@ from uuid import UUID, uuid4
 
 import pytest
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import delete, func, select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 
-from servicepilot.agent.models import AgentExecution
-from servicepilot.config import Settings
+from servicepilot.config import SIMULATED_RECIPIENT, Settings
 from servicepilot.conversations.context import build_context
-from servicepilot.conversations.routes import SIMULATED_RECIPIENT
 from servicepilot.conversations.schemas import InboundSMS
 from servicepilot.conversations.service import persist_inbound
-from servicepilot.db.models import Appointment, AppointmentActionResult, Conversation, Customer, Message, Tenant, Vehicle
-from servicepilot.db.session import build_session_factory
+from servicepilot.db.models import Appointment, Conversation, Customer, Message, Tenant, Vehicle
 from servicepilot.main import create_app
 
 SHARED_PHONE = "+12065550191"
@@ -26,13 +23,14 @@ FOREIGN_HEADERS = {"X-API-Key": "test-foreign-key"}
 
 
 @pytest.fixture
-async def sms_data(migrated_database):
-    sessions = build_session_factory(migrated_database)
+async def sms_data(committed_tenants):
+    sessions, tenant_ids = committed_tenants
     async with sessions.begin() as session:
         local = Tenant(slug=f"sms-local-{uuid4().hex}", name="SMS Local")
         foreign = Tenant(slug=f"sms-foreign-{uuid4().hex}", name="SMS Foreign")
         session.add_all([local, foreign])
         await session.flush()
+        tenant_ids.extend((local.id, foreign.id))
         local_customer = Customer(tenant_id=local.id, phone_number=SHARED_PHONE, name="Local Customer")
         foreign_customer = Customer(tenant_id=foreign.id, phone_number=SHARED_PHONE, name="Foreign Customer")
         session.add_all([
@@ -54,14 +52,7 @@ async def sms_data(migrated_database):
                 tenant_id=customer.tenant_id, customer_id=customer.id, vehicle_id=vehicle.id,
                 scheduled_start=start, scheduled_end=start + timedelta(hours=1), service_type="Oil change",
             ))
-    try:
-        yield sessions, local, foreign, local_customer, foreign_customer
-    finally:
-        async with sessions.begin() as session:
-            tenant_ids = [local.id, foreign.id]
-            for model in (AppointmentActionResult, AgentExecution, Message, Conversation, Appointment, Vehicle, Customer):
-                await session.execute(delete(model).where(model.tenant_id.in_(tenant_ids)))
-            await session.execute(delete(Tenant).where(Tenant.id.in_(tenant_ids)))
+    return sessions, local, foreign, local_customer, foreign_customer
 
 
 def simulation_app(database_settings, sms_data, *, enabled):
