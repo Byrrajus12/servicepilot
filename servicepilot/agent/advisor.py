@@ -13,6 +13,7 @@ from agents import (
 from agents.agent import ToolsToFinalOutputResult
 from agents.exceptions import ModelRefusalError
 from openai import AsyncOpenAI
+from openai.types.shared import Reasoning
 from pydantic import BaseModel, ConfigDict
 
 from servicepilot.agent.actions import confirmation_prompt, local_time
@@ -20,7 +21,7 @@ from servicepilot.agent.tools import (
     ADVISOR_TOOLS, INTENT_RECORDED, RESULT_LIMIT, AdvisorContext, AvailabilityPeriod, appointment_data,
     interpret_appointment_reply, vehicle_data,
 )
-from servicepilot.config import Settings
+from servicepilot.config import DEFAULT_ADVISOR_MODEL, DEFAULT_ADVISOR_REASONING_EFFORT, Settings
 from servicepilot.conversations.context import ConversationContext
 from servicepilot.conversations.pending import HANDOFF, PublishedProposal
 
@@ -204,6 +205,17 @@ class ModelReply:
     output_tokens: int
 
 
+def advisor_model_settings(settings: Settings) -> ModelSettings:
+    effort = settings.agent_reasoning_effort
+    if effort is None and settings.agent_model == DEFAULT_ADVISOR_MODEL:
+        effort = DEFAULT_ADVISOR_REASONING_EFFORT
+    elif effort is None and settings.agent_model.startswith("gpt-6"):
+        effort = "none"
+    reasoning = Reasoning(effort=effort) if effort is not None else None
+    budget = settings.agent_max_output_tokens or (2048 if effort not in (None, "none") else 512)
+    return ModelSettings(store=False, max_tokens=budget, parallel_tool_calls=False, reasoning=reasoning)
+
+
 class MissingAPIKey(Exception):
     pass
 
@@ -220,7 +232,7 @@ async def run_advisor(settings: Settings, context: AdvisorContext, model_input: 
             name="Service Advisor",
             instructions=ADVISOR_INSTRUCTIONS,
             model=OpenAIResponsesModel(settings.agent_model, openai_client=client),
-            model_settings=ModelSettings(store=False, max_tokens=400, parallel_tool_calls=False),
+            model_settings=advisor_model_settings(settings),
             tools=ADVISOR_TOOLS,
             output_type=AdvisorOutput,
             tool_use_behavior=finish_prepared_proposal,

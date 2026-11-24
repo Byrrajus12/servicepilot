@@ -8,6 +8,8 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.exc import ArgumentError
 
 SIMULATED_RECIPIENT = "+12065550100"
+DEFAULT_ADVISOR_MODEL = "gpt-6-luna"
+DEFAULT_ADVISOR_REASONING_EFFORT = "low"
 
 
 class Settings(BaseSettings):
@@ -19,9 +21,11 @@ class Settings(BaseSettings):
     dealership_api_keys: dict[str, SecretStr] = Field(default_factory=dict)
     enable_sms_simulation: bool = False
     openai_api_key: SecretStr | None = None
-    agent_model: str = Field(default="gpt-4.1-mini", min_length=1, max_length=120)
-    agent_timeout_seconds: float = Field(default=30, ge=1, le=120)
-    agent_max_turns: int = Field(default=5, ge=1, le=10)
+    agent_model: str = Field(default=DEFAULT_ADVISOR_MODEL, min_length=1, max_length=120)
+    agent_reasoning_effort: Literal["none", "low", "medium", "high"] | None = None
+    agent_max_output_tokens: int | None = Field(default=None, ge=256, le=8192)
+    agent_timeout_seconds: float = Field(default=45, ge=1, le=120)
+    agent_max_turns: int = Field(default=7, ge=1, le=10)
     agent_max_attempts: int = Field(default=3, ge=1, le=10)
     worker_poll_seconds: float = Field(default=1, ge=0.1, le=30)
     worker_concurrency: int = Field(default=4, ge=1, le=16)
