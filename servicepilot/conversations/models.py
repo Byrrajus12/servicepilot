@@ -64,6 +64,7 @@ class Conversation(TenantOwned, Base):
     pending_action_payload: Mapped[dict[str, JsonValue] | None] = mapped_column(JSONB(none_as_null=True))
     pending_action_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     pending_confirmation: Mapped[ConfirmationState | None] = mapped_column(String(32))
+    conditional_request: Mapped[dict[str, JsonValue] | None] = mapped_column(JSONB(none_as_null=True))
 
 
 class Message(TenantOwned, Base):

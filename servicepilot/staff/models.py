@@ -89,6 +89,11 @@ class Consultation(TenantOwned, Base):
             ["tenant_id", "conversation_id", "inbound_id"],
             ["messages.tenant_id", "messages.conversation_id", "messages.id"],
         ),
+        ForeignKeyConstraint(
+            ["tenant_id", "conversation_id", "condition_request_id"],
+            ["messages.tenant_id", "messages.conversation_id", "messages.id"],
+            name="fk_consultations_condition_request",
+        ),
         ForeignKeyConstraint(["tenant_id", "answered_by"], ["employees.tenant_id", "employees.id"]),
         ForeignKeyConstraint(["tenant_id", "assigned_id"], ["employees.tenant_id", "employees.id"]),
         UniqueConstraint("tenant_id", "conversation_id", "execution_id", "ownership_version", "question"),
@@ -99,6 +104,7 @@ class Consultation(TenantOwned, Base):
     conversation_id: Mapped[UUID]
     execution_id: Mapped[UUID]
     inbound_id: Mapped[UUID]
+    condition_request_id: Mapped[UUID | None]
     assigned_id: Mapped[UUID | None]
     ownership_version: Mapped[int]
     status: Mapped[str] = mapped_column(String(16), server_default="open")

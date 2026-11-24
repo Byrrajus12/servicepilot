@@ -29,4 +29,5 @@ class Tenant(Record, Base):
     service_capacity: Mapped[int] = mapped_column(server_default="1")
     closed_dates: Mapped[list[date]] = mapped_column(ARRAY(Date), server_default="{}")
     service_catalog: Mapped[dict] = mapped_column(JSONB, server_default="{}")
+    service_settings_managed: Mapped[bool] = mapped_column(server_default="false")
     service_policies: Mapped[dict] = mapped_column(JSONB, server_default="{}")
