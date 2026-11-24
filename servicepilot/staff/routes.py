@@ -1,13 +1,18 @@
 from typing import Annotated
+from uuid import UUID
 
-from fastapi import APIRouter, Request, Response
+from anyio import to_thread
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.routing import APIRoute
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, StringConstraints
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
+from sqlalchemy.dialects.postgresql import insert
 
-from servicepilot.staff.auth import EmployeeTransaction, new_session, password_matches, unauthorized
-from servicepilot.staff.models import Employee
+from servicepilot.staff.auth import (
+    EmployeeTransaction, hash_password, new_session, password_jobs, password_matches, unauthorized,
+)
+from servicepilot.staff.models import Employee, EmployeeRole, EmployeeSession
 from servicepilot.tenancy.models import Tenant
 
 
@@ -29,6 +34,7 @@ class StaffRoute(APIRoute):
 router = APIRouter(prefix="/staff", tags=["staff"], route_class=StaffRoute)
 
 Username = Annotated[str, StringConstraints(strip_whitespace=True, to_lower=True, pattern=r"^[a-z0-9._@+-]{2,100}$")]
+ShortText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=500, pattern=r"^[^\x00]+$")]
 
 
 class Input(BaseModel):
@@ -40,8 +46,32 @@ class Login(Input):
     username: Username
     password: SecretStr = Field(min_length=1, max_length=128)
 
+class CreateEmployee(Input):
+    username: Username
+    display_name: Annotated[ShortText, Field(max_length=120)]
+    password: SecretStr = Field(min_length=12, max_length=128)
+    role: EmployeeRole = "advisor"
+
+
+class EmployeeState(Input):
+    disabled: bool
+
+class Page:
+    def __init__(
+        self, limit: Annotated[int, Query(ge=1, le=50)] = 20,
+        offset: Annotated[int, Query(ge=0, le=10000)] = 0,
+    ):
+        self.limit, self.offset = limit, offset
+
+
+Pagination = Annotated[Page, Depends()]
+
 def employee_view(employee: Employee) -> dict:
     return {key: getattr(employee, key) for key in ("id", "username", "display_name", "role", "disabled")}
+
+def require_manager(employee: Employee) -> None:
+    if employee.role != "manager":
+        raise HTTPException(403, "Manager permission required")
 
 @router.post("/sessions")
 async def login(body: Login, request: Request, response: Response) -> dict:
@@ -72,3 +102,45 @@ async def logout(tx: EmployeeTransaction) -> Response:
 async def me(tx: EmployeeTransaction) -> dict:
     _, employee, _ = tx
     return employee_view(employee) | {"tenant_id": employee.tenant_id}
+
+@router.get("/employees")
+async def employees(tx: EmployeeTransaction, page: Pagination) -> list[dict]:
+    session, employee, _ = tx
+    rows = await session.scalars(select(Employee).where(
+        Employee.tenant_id == employee.tenant_id,
+    ).order_by(Employee.username, Employee.id).offset(page.offset).limit(page.limit))
+    return [employee_view(row) for row in rows]
+
+
+@router.post("/employees", status_code=201)
+async def create_employee(body: CreateEmployee, tx: EmployeeTransaction) -> dict:
+    session, employee, _ = tx
+    require_manager(employee)
+    password_hash = await to_thread.run_sync(hash_password, body.password.get_secret_value(), limiter=password_jobs)
+    created = await session.scalar(insert(Employee).values(
+        tenant_id=employee.tenant_id, username=body.username, display_name=body.display_name,
+        password_hash=password_hash, role=body.role,
+    ).on_conflict_do_nothing(index_elements=["tenant_id", "username"]).returning(Employee))
+    if created is None:
+        raise HTTPException(409, "Employee already exists")
+    return employee_view(created)
+
+
+@router.patch("/employees/{employee_id}")
+async def change_employee(employee_id: UUID, body: EmployeeState, tx: EmployeeTransaction) -> dict:
+    session, employee, _ = tx
+    require_manager(employee)
+    if employee_id == employee.id:
+        raise HTTPException(409, "You cannot disable your own account")
+    target = await session.scalar(select(Employee).where(
+        Employee.tenant_id == employee.tenant_id, Employee.id == employee_id,
+    ).with_for_update())
+    if target is None:
+        raise HTTPException(404, "Employee not found")
+    target.disabled = body.disabled
+    if body.disabled:
+        await session.execute(update(EmployeeSession).where(
+            EmployeeSession.tenant_id == employee.tenant_id, EmployeeSession.employee_id == target.id,
+            EmployeeSession.revoked_at.is_(None),
+        ).values(revoked_at=func.clock_timestamp()))
+    return employee_view(target)
