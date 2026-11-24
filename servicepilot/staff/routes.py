@@ -19,7 +19,7 @@ from servicepilot.staff.auth import (
     EmployeeTransaction, hash_password, new_session, password_jobs, password_matches, unauthorized,
 )
 from servicepilot.staff.consultations import thread_consultations
-from servicepilot.staff.models import Consultation, Employee, EmployeeRole, EmployeeSession
+from servicepilot.staff.models import Consultation, Employee, EmployeeRole, EmployeeSession, StaffNote
 from servicepilot.tenancy.models import Tenant
 
 
@@ -42,6 +42,7 @@ router = APIRouter(prefix="/staff", tags=["staff"], route_class=StaffRoute)
 
 Username = Annotated[str, StringConstraints(strip_whitespace=True, to_lower=True, pattern=r"^[a-z0-9._@+-]{2,100}$")]
 ShortText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=500, pattern=r"^[^\x00]+$")]
+MessageText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=1600, pattern=r"^[^\x00]+$")]
 
 
 class Input(BaseModel):
@@ -62,6 +63,13 @@ class CreateEmployee(Input):
 
 class EmployeeState(Input):
     disabled: bool
+
+class Note(Input):
+    body: MessageText
+
+
+class InternalNote(Note):
+    reply_to_id: UUID | None = None
 
 class ServiceInformation(Input):
     name: Annotated[ShortText, Field(max_length=120)]
@@ -108,6 +116,10 @@ def record_view(item, fields: str) -> dict:
 def require_manager(employee: Employee) -> None:
     if employee.role != "manager":
         raise HTTPException(403, "Manager permission required")
+
+def require_assignment(employee: Employee, assigned: UUID | None) -> None:
+    if assigned not in (None, employee.id) and employee.role != "manager":
+        raise HTTPException(403, "Assigned to another employee")
 
 async def get_thread(
     session: AsyncSession, employee: Employee, conversation_id: UUID, *, write: bool = False,
@@ -263,3 +275,31 @@ async def messages(conversation_id: UUID, tx: EmployeeTransaction, page: Paginat
         | {"delivery_status": status, "delivery_error_code": error_code}
         for message, status, error_code in rows
     ]
+
+@router.get("/conversations/{conversation_id}/notes")
+async def notes(conversation_id: UUID, tx: EmployeeTransaction, page: Pagination) -> list[dict]:
+    session, employee, _ = tx
+    await get_thread(session, employee, conversation_id)
+    rows = await session.scalars(select(StaffNote).where(
+        StaffNote.tenant_id == employee.tenant_id, StaffNote.conversation_id == conversation_id,
+    ).order_by(StaffNote.created_at.desc(), StaffNote.id.desc()).offset(page.offset).limit(page.limit))
+    return [record_view(row, "employee_id body reply_to_id") for row in rows]
+
+
+@router.post("/conversations/{conversation_id}/notes", status_code=201)
+async def add_note(conversation_id: UUID, body: InternalNote, tx: EmployeeTransaction) -> dict:
+    session, employee, _ = tx
+    conversation = await get_thread(session, employee, conversation_id, write=True)
+    require_assignment(employee, conversation.assigned_employee_id)
+    if body.reply_to_id is not None and not await session.scalar(select(exists().where(
+        StaffNote.tenant_id == employee.tenant_id, StaffNote.conversation_id == conversation_id,
+        StaffNote.id == body.reply_to_id,
+    ))):
+        raise HTTPException(404, "Internal note not found")
+    note = StaffNote(
+        tenant_id=employee.tenant_id, conversation_id=conversation_id, employee_id=employee.id, body=body.body,
+        reply_to_id=body.reply_to_id,
+    )
+    session.add(note)
+    await session.flush()
+    return record_view(note, "employee_id body reply_to_id")
