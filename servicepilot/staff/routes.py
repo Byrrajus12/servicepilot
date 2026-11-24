@@ -1,3 +1,4 @@
+from datetime import date
 from typing import Annotated
 from uuid import UUID
 
@@ -5,7 +6,7 @@ from anyio import to_thread
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.routing import APIRoute
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, StringConstraints
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, StringConstraints, field_validator
 from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert
 
@@ -55,6 +56,24 @@ class CreateEmployee(Input):
 
 class EmployeeState(Input):
     disabled: bool
+
+class ServiceInformation(Input):
+    name: Annotated[ShortText, Field(max_length=120)]
+    description: ShortText
+    minutes: int = Field(ge=1, le=720)
+
+
+class ServiceSettings(Input):
+    services: list[ServiceInformation] = Field(max_length=40)
+    policies: dict[ShortText, ShortText] = Field(max_length=30)
+    closed_dates: list[date] = Field(max_length=366)
+
+    @field_validator("services")
+    @classmethod
+    def unique_services(cls, services: list[ServiceInformation]) -> list[ServiceInformation]:
+        if len({service.name.casefold() for service in services}) != len(services):
+            raise ValueError("Service names must be unique")
+        return services
 
 class Page:
     def __init__(
@@ -144,3 +163,14 @@ async def change_employee(employee_id: UUID, body: EmployeeState, tx: EmployeeTr
             EmployeeSession.revoked_at.is_(None),
         ).values(revoked_at=func.clock_timestamp()))
     return employee_view(target)
+
+@router.put("/service-settings")
+async def set_service_information(body: ServiceSettings, tx: EmployeeTransaction) -> ServiceSettings:
+    session, employee, _ = tx
+    require_manager(employee)
+    dealer = await session.get_one(Tenant, employee.tenant_id, with_for_update=True)
+    dealer.service_catalog = {entry.name.casefold(): entry.model_dump() for entry in body.services}
+    dealer.service_settings_managed = True
+    dealer.service_policies = body.policies
+    dealer.closed_dates = sorted(set(body.closed_dates))
+    return body
