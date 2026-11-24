@@ -7,6 +7,7 @@ from servicepilot.conversations.pending import AppointmentActionResult
 from servicepilot.customers.models import Customer
 from servicepilot.integrations.models import IntegrationEvent
 from servicepilot.sms.models import SMSConsent, SMSDelivery
+from servicepilot.staff.models import Consultation, Employee, EmployeeSession, OwnershipEvent, StaffNote
 from servicepilot.tenancy.models import Tenant
 from servicepilot.vehicles.models import Vehicle
 from servicepilot.workflows.models import Workflow
@@ -16,11 +17,16 @@ __all__ = [
     "Appointment",
     "AppointmentActionResult",
     "Conversation",
+    "Consultation",
     "Customer",
+    "Employee",
+    "EmployeeSession",
     "IntegrationEvent",
     "Message",
+    "OwnershipEvent",
     "SMSConsent",
     "SMSDelivery",
+    "StaffNote",
     "Tenant",
     "Vehicle",
     "Workflow",

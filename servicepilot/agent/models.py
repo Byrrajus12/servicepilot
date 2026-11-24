@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Literal
 from uuid import UUID
 
-from sqlalchemy import CheckConstraint, DateTime, ForeignKeyConstraint, Index, String, text
+from sqlalchemy import CheckConstraint, Computed, DateTime, ForeignKeyConstraint, Index, String, UniqueConstraint, Uuid, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -15,9 +15,10 @@ class AgentExecution(TenantOwned, Base):
     __tablename__ = "agent_executions"
     __table_args__ = (
         ForeignKeyConstraint(
-            ["tenant_id", "conversation_id", "id"],
+            ["tenant_id", "conversation_id", "source_message_id"],
             ["messages.tenant_id", "messages.conversation_id", "messages.id"],
         ),
+        UniqueConstraint("tenant_id", "conversation_id", "id"),
         ForeignKeyConstraint(
             ["tenant_id", "conversation_id", "reply_id"],
             ["messages.tenant_id", "messages.conversation_id", "messages.id"],
@@ -36,9 +37,11 @@ class AgentExecution(TenantOwned, Base):
         CheckConstraint("next_attempt_at IS NULL OR status = 'failed'", name="retry"),
     )
 
-    # The primary key is the inbound message ID, so an inbound SMS has at most one execution.
+    # Direct work uses the inbound ID. Resumption uses a consultation ID and the original SMS for routing.
     id: Mapped[UUID] = mapped_column(primary_key=True)
     conversation_id: Mapped[UUID]
+    resume_source_id: Mapped[UUID | None]
+    source_message_id: Mapped[UUID] = mapped_column(Uuid, Computed("coalesce(resume_source_id, id)"))
     status: Mapped[ExecutionStatus] = mapped_column(String(16), server_default="pending")
     attempts: Mapped[int] = mapped_column(server_default="0")
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

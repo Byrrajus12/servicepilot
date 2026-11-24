@@ -21,6 +21,10 @@ class Conversation(TenantOwned, Base):
     __table_args__ = (
         ForeignKeyConstraint(["tenant_id", "customer_id"], ["customers.tenant_id", "customers.id"]),
         UniqueConstraint("tenant_id", "id"),
+        ForeignKeyConstraint(["tenant_id", "assigned_employee_id"], ["employees.tenant_id", "employees.id"]),
+        CheckConstraint("owner IN ('ai', 'human')", name="owner"),
+        CheckConstraint("owner != 'human' OR assigned_employee_id IS NOT NULL", name="human_assignment"),
+        Index(None, "tenant_id", "assigned_employee_id"),
         Index(None, "tenant_id", "customer_id"),
         Index(
             "uq_conversations_open_sms_thread", "tenant_id", "sender_number", "recipient_number",
@@ -47,6 +51,9 @@ class Conversation(TenantOwned, Base):
     )
 
     customer_id: Mapped[UUID | None]
+    owner: Mapped[Literal["ai", "human"]] = mapped_column(String(8), server_default="ai")
+    ownership_version: Mapped[int] = mapped_column(server_default="0")
+    assigned_employee_id: Mapped[UUID | None]
     sender_number: Mapped[str | None] = mapped_column(String(16))
     recipient_number: Mapped[str | None] = mapped_column(String(16))
     status: Mapped[ConversationStatus] = mapped_column(String(16), server_default="open")
@@ -66,6 +73,13 @@ class Message(TenantOwned, Base):
             ["tenant_id", "conversation_id"], ["conversations.tenant_id", "conversations.id"]
         ),
         UniqueConstraint("tenant_id", "conversation_id", "id"),
+        ForeignKeyConstraint(["tenant_id", "employee_id"], ["employees.tenant_id", "employees.id"]),
+        UniqueConstraint("tenant_id", "conversation_id", "employee_request_id"),
+        CheckConstraint(
+            "(employee_id IS NULL AND employee_request_id IS NULL) OR "
+            "(direction = 'outbound' AND employee_id IS NOT NULL AND employee_request_id IS NOT NULL)",
+            name="employee_reply",
+        ),
         CheckConstraint("direction IN ('inbound', 'outbound')", name="direction"),
         Index(None, "tenant_id", "conversation_id", "occurred_at", "created_at", "id"),
         Index(
@@ -75,6 +89,8 @@ class Message(TenantOwned, Base):
     )
 
     conversation_id: Mapped[UUID]
+    employee_id: Mapped[UUID | None]
+    employee_request_id: Mapped[UUID | None]
     direction: Mapped[str] = mapped_column(String(8))
     from_number: Mapped[str] = mapped_column(String(16))
     to_number: Mapped[str] = mapped_column(String(16))

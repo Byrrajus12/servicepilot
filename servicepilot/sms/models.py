@@ -23,6 +23,10 @@ class SMSDelivery(TenantOwned, Base):
             ["tenant_id", "conversation_id", "confirmation_for_id"],
             ["messages.tenant_id", "messages.conversation_id", "messages.id"],
         ),
+        ForeignKeyConstraint(
+            ["tenant_id", "conversation_id", "inbound_guard_id"],
+            ["messages.tenant_id", "messages.conversation_id", "messages.id"],
+        ),
         UniqueConstraint("provider", "account_sid", "provider_message_id"),
         CheckConstraint("provider IN ('simulation', 'twilio')", name="provider"),
         CheckConstraint(
@@ -45,6 +49,9 @@ class SMSDelivery(TenantOwned, Base):
 
     id: Mapped[UUID] = mapped_column(primary_key=True)
     conversation_id: Mapped[UUID]
+    ai_ownership_version: Mapped[int | None] = mapped_column(server_default="0")
+    inbound_guard_id: Mapped[UUID | None]
+    submission_started: Mapped[bool] = mapped_column(server_default="false")
     provider: Mapped[str] = mapped_column(String(16))
     account_sid: Mapped[str | None] = mapped_column(String(34))
     sender: Mapped[str] = mapped_column(String(16))

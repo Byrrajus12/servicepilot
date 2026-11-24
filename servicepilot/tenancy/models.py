@@ -1,7 +1,7 @@
-from datetime import time
+from datetime import date, time
 
-from sqlalchemy import CheckConstraint, Integer, String, Time, text
-from sqlalchemy.dialects.postgresql import ARRAY
+from sqlalchemy import CheckConstraint, Date, Integer, String, Time, text
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from servicepilot.db.base import Base, Record
@@ -27,3 +27,6 @@ class Tenant(Record, Base):
     closes_at: Mapped[time] = mapped_column(Time, server_default="17:00")
     appointment_minutes: Mapped[int] = mapped_column(server_default="60")
     service_capacity: Mapped[int] = mapped_column(server_default="1")
+    closed_dates: Mapped[list[date]] = mapped_column(ARRAY(Date), server_default="{}")
+    service_catalog: Mapped[dict] = mapped_column(JSONB, server_default="{}")
+    service_policies: Mapped[dict] = mapped_column(JSONB, server_default="{}")
