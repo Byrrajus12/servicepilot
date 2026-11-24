@@ -1,4 +1,5 @@
 import asyncio
+from argparse import ArgumentParser
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from uuid import NAMESPACE_URL, uuid5
@@ -44,13 +45,38 @@ DEALERSHIPS = (
     ),
 )
 
+DEMO_SERVICES = {
+    "oil change": {"name": "Oil change", "description": "Replace the engine oil and filter.", "minutes": 30},
+    "brake inspection": {"name": "Brake inspection", "description": "Inspect the pads, rotors and brakes.", "minutes": 45},
+    "tire rotation": {"name": "Tire rotation", "description": "Rotate the tires and check pressures.", "minutes": 30},
+    "battery check": {"name": "Battery check", "description": "Test the battery and charging system.", "minutes": 30},
+    "wheel alignment": {"name": "Wheel alignment", "description": "Check and adjust wheel alignment.", "minutes": 60},
+    "multi-point inspection": {
+        "name": "Multi-point inspection", "description": "Check tires, fluids, lights and visible wear.", "minutes": 45,
+    },
+}
+DEMO_POLICIES = {"arrival": "Please check in at the service desk with your vehicle key."}
 
-async def seed_database(session: AsyncSession) -> None:
+
+async def seed_database(session: AsyncSession, *, backfill_service_catalog: bool = False) -> None:
     for slug, name, visits in DEALERSHIPS:
-        await session.execute(
-            insert(Tenant).values(slug=slug, name=name).on_conflict_do_nothing(index_elements=["slug"])
+        catalog = {key: value for key, value in DEMO_SERVICES.items()}
+        inserted = await session.scalar(
+            insert(Tenant).values(slug=slug, name=name, service_catalog=catalog, service_policies=DEMO_POLICIES)
+            .on_conflict_do_nothing(index_elements=["slug"]).returning(Tenant.id)
         )
-        tenant_id = (await session.execute(select(Tenant.id).where(Tenant.slug == slug))).scalar_one()
+        tenant = await session.scalar(select(Tenant).where(Tenant.slug == slug).with_for_update())
+        tenant_id = tenant.id
+        if inserted is None:
+            demo_customer = uuid5(NAMESPACE_URL, f"servicepilot/demo/{tenant_id}/customer/1")
+            # Match the existing fixture's deterministic identity and synthetic phone, not its slug alone.
+            existing_demo = await session.scalar(select(Customer.id).where(
+                Customer.id == demo_customer, Customer.tenant_id == tenant_id, Customer.phone_number == visits[0].phone_number,
+            ))
+            if existing_demo is None:
+                continue
+            if backfill_service_catalog and not tenant.service_settings_managed and not tenant.service_catalog:
+                tenant.service_catalog = catalog
 
         for index, visit in enumerate(visits, start=1):
             customer_id = uuid5(NAMESPACE_URL, f"servicepilot/demo/{tenant_id}/customer/{index}")
@@ -82,7 +108,7 @@ async def seed_database(session: AsyncSession) -> None:
                     vehicle_id=vehicle_id,
                     external_dms_id=f"DEMO-{index:03d}",
                     scheduled_start=start,
-                    scheduled_end=start + timedelta(minutes=45),
+                    scheduled_end=start + timedelta(minutes=DEMO_SERVICES[visit.service_type.casefold()]["minutes"]),
                     service_type=visit.service_type,
                 )
                 .on_conflict_do_nothing(index_elements=["tenant_id", "external_dms_id"])
@@ -90,10 +116,14 @@ async def seed_database(session: AsyncSession) -> None:
 
 
 async def main() -> None:
+    parser = ArgumentParser(description="Seed the fictional ServicePilot dealerships.")
+    parser.add_argument("--backfill-service-catalog", action="store_true",
+                        help="Fill empty service catalogs for the existing demo dealerships.")
+    args = parser.parse_args()
     engine = build_engine(Settings())
     try:
         async with build_session_factory(engine).begin() as session:
-            await seed_database(session)
+            await seed_database(session, backfill_service_catalog=args.backfill_service_catalog)
     finally:
         await engine.dispose()
 

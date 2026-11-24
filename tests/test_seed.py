@@ -12,6 +12,7 @@ async def test_seed_is_repeatable_and_creates_two_consistent_dealerships(session
 
     tenants = (await session.scalars(select(Tenant).order_by(Tenant.slug))).all()
     assert [tenant.slug for tenant in tenants] == ["cedar-ridge-motors", "harbor-point-auto"]
+    assert tenants[0].service_catalog["tire rotation"]["minutes"] == 30
     for tenant in tenants:
         for model in (Customer, Vehicle, Appointment):
             count = await session.scalar(
@@ -32,3 +33,28 @@ async def test_seed_is_repeatable_and_creates_two_consistent_dealerships(session
             assert visit.customer_id == vehicle.customer_id
             assert visit.scheduled_start < visit.scheduled_end
             assert visit.status == "scheduled"
+
+
+async def test_demo_catalog_backfill_preserves_existing_knowledge_and_limits_scope(session):
+    harbor = Tenant(slug="harbor-point-auto", name="An existing real tenant with a reserved slug")
+    session.add(harbor)
+    await session.flush()
+    await seed_database(session)
+    cedar = await session.scalar(select(Tenant).where(Tenant.slug == "cedar-ridge-motors"))
+    cedar.service_catalog = {}
+    cedar.service_policies = {"fee": "Call us"}
+    await session.flush()
+    await seed_database(session)
+    assert cedar.service_catalog == {}
+    await seed_database(session, backfill_service_catalog=True)
+    for tenant in (cedar, harbor):
+        await session.refresh(tenant)
+    assert cedar.service_catalog["tire rotation"]["minutes"] == 30
+    assert cedar.service_policies == {"fee": "Call us"}
+    assert harbor.service_catalog == {}
+    assert not await session.scalar(select(Customer.id).where(Customer.tenant_id == harbor.id))
+    cedar.service_catalog = {}
+    cedar.service_settings_managed = True
+    await session.flush()
+    await seed_database(session, backfill_service_catalog=True)
+    assert cedar.service_catalog == {}
