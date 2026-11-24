@@ -1,5 +1,5 @@
 from datetime import date
-from typing import Annotated
+from typing import Annotated, Literal
 from uuid import UUID
 
 from anyio import to_thread
@@ -7,13 +7,19 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.routing import APIRoute
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, StringConstraints, field_validator
-from sqlalchemy import func, select, update
+from sqlalchemy import exists, func, select, update
 from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from servicepilot.agent.actions import lock_conversation
+from servicepilot.conversations.context import build_context
+from servicepilot.conversations.models import Conversation, Message
+from servicepilot.sms.models import SMSDelivery
 from servicepilot.staff.auth import (
     EmployeeTransaction, hash_password, new_session, password_jobs, password_matches, unauthorized,
 )
-from servicepilot.staff.models import Employee, EmployeeRole, EmployeeSession
+from servicepilot.staff.consultations import thread_consultations
+from servicepilot.staff.models import Consultation, Employee, EmployeeRole, EmployeeSession
 from servicepilot.tenancy.models import Tenant
 
 
@@ -88,9 +94,49 @@ Pagination = Annotated[Page, Depends()]
 def employee_view(employee: Employee) -> dict:
     return {key: getattr(employee, key) for key in ("id", "username", "display_name", "role", "disabled")}
 
+def conversation_view(conversation: Conversation, waiting: bool) -> dict:
+    return {
+        "id": conversation.id, "status": conversation.status, "owner": conversation.owner,
+        "assigned_employee_id": conversation.assigned_employee_id, "ownership_version": conversation.ownership_version,
+        "waiting_for_staff": waiting, "customer_id": conversation.customer_id, "updated_at": conversation.updated_at,
+    }
+
+
+def record_view(item, fields: str) -> dict:
+    return {key: getattr(item, key) for key in ("id", "created_at", *fields.split())}
+
 def require_manager(employee: Employee) -> None:
     if employee.role != "manager":
         raise HTTPException(403, "Manager permission required")
+
+async def get_thread(
+    session: AsyncSession, employee: Employee, conversation_id: UUID, *, write: bool = False,
+) -> Conversation:
+    if write:
+        conversation = await lock_conversation(session, employee.tenant_id, conversation_id)
+    else:
+        conversation = await session.scalar(select(Conversation).where(
+            Conversation.tenant_id == employee.tenant_id, Conversation.id == conversation_id,
+        ))
+    if conversation is None:
+        raise HTTPException(404, "Conversation not found")
+    if write and conversation.status != "open":
+        raise HTTPException(409, "Conversation closed")
+    return conversation
+
+
+def waiting_filter():
+    return exists().where(
+        Consultation.tenant_id == Conversation.tenant_id, Consultation.conversation_id == Conversation.id,
+        Consultation.status.in_(("open", "answered")),
+    )
+
+
+async def view_thread(session: AsyncSession, conversation: Conversation) -> dict:
+    waiting = await session.scalar(select(exists().where(
+        *thread_consultations(conversation), Consultation.status.in_(("open", "answered")),
+    )))
+    return conversation_view(conversation, waiting)
 
 @router.post("/sessions")
 async def login(body: Login, request: Request, response: Response) -> dict:
@@ -174,3 +220,46 @@ async def set_service_information(body: ServiceSettings, tx: EmployeeTransaction
     dealer.service_policies = body.policies
     dealer.closed_dates = sorted(set(body.closed_dates))
     return body
+
+@router.get("/conversations")
+async def conversations(
+    tx: EmployeeTransaction, page: Pagination, owner: Literal["ai", "human"] | None = None,
+    assigned_employee_id: UUID | None = None, waiting: bool | None = None,
+) -> list[dict]:
+    session, employee, _ = tx
+    has_waiting = waiting_filter()
+    query = select(Conversation, has_waiting).where(Conversation.tenant_id == employee.tenant_id)
+    if owner is not None:
+        query = query.where(Conversation.owner == owner)
+    if assigned_employee_id is not None:
+        query = query.where(Conversation.assigned_employee_id == assigned_employee_id)
+    if waiting is not None:
+        query = query.where(has_waiting if waiting else ~has_waiting)
+    rows = await session.execute(query.order_by(
+        Conversation.updated_at.desc(), Conversation.id.desc(),
+    ).offset(page.offset).limit(page.limit))
+    return [conversation_view(conversation, is_waiting) for conversation, is_waiting in rows]
+
+
+@router.get("/conversations/{conversation_id}")
+async def get_conversation(conversation_id: UUID, tx: EmployeeTransaction) -> dict:
+    session, employee, _ = tx
+    conversation = await get_thread(session, employee, conversation_id)
+    context = await build_context(session, employee.tenant_id, conversation_id, history_limit=1)
+    return await view_thread(session, conversation) | {"context": context.operations}
+
+
+@router.get("/conversations/{conversation_id}/messages")
+async def messages(conversation_id: UUID, tx: EmployeeTransaction, page: Pagination) -> list[dict]:
+    session, employee, _ = tx
+    await get_thread(session, employee, conversation_id)
+    rows = await session.execute(select(Message, SMSDelivery.status, SMSDelivery.error_code).outerjoin(
+        SMSDelivery, (SMSDelivery.id == Message.id) & (SMSDelivery.tenant_id == Message.tenant_id),
+    ).where(
+        Message.tenant_id == employee.tenant_id, Message.conversation_id == conversation_id,
+    ).order_by(Message.created_at.desc(), Message.id.desc()).offset(page.offset).limit(page.limit))
+    return [
+        record_view(message, "direction body occurred_at employee_id")
+        | {"delivery_status": status, "delivery_error_code": error_code}
+        for message, status, error_code in rows
+    ]
