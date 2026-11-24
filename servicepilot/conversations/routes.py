@@ -8,9 +8,11 @@ from sqlalchemy import func, select
 from servicepilot.agent.execution import (
     ExecutionView, PreviousMessagePending, get_execution, process_execution,
 )
+from servicepilot.agent.models import AgentExecution
+from servicepilot.appointments.schemas import PhoneNumber
 from servicepilot.config import SIMULATED_RECIPIENT
 from servicepilot.conversations.context import HistoryMessage, read_history
-from servicepilot.conversations.models import Conversation
+from servicepilot.conversations.models import Conversation, Message
 from servicepilot.conversations.pending import AppointmentActionResult, pending_proposal
 from servicepilot.conversations.schemas import InboundResult, InboundSMS, SMSContent
 from servicepilot.sms.delivery import DeliveryView, deliver_next
@@ -18,6 +20,8 @@ from servicepilot.sms.ingest import ingest_sms
 from servicepilot.sms.models import SMSDelivery
 from servicepilot.sms.request import read_sms_body
 from servicepilot.sms.transport import SimulationTransport
+from servicepilot.staff.consultations import thread_consultations
+from servicepilot.staff.models import Consultation
 from servicepilot.tenancy.auth import AuthenticatedDealership, DealershipTransaction
 
 router = APIRouter()
@@ -26,6 +30,46 @@ router = APIRouter()
 def require_simulation(request: Request) -> None:
     if not request.app.state.settings.enable_sms_simulation:
         raise HTTPException(404, "SMS simulation is disabled")
+
+
+@router.get("/simulations/sms")
+async def simulated_inbox(
+    sender_phone: PhoneNumber, dealership: DealershipTransaction, request: Request,
+    include_all: bool = False,
+) -> dict:
+    require_simulation(request)
+    session, tenant_id = dealership
+    conversation = await session.scalar(select(Conversation).where(
+        Conversation.tenant_id == tenant_id, Conversation.sender_number == sender_phone,
+        Conversation.recipient_number == SIMULATED_RECIPIENT, Conversation.status == "open",
+    ))
+    if conversation is None:
+        return {"conversation_id": None, "owner": None, "waiting_for_staff": False, "outbound": []}
+    waiting = await session.scalar(select(select(Consultation.id).where(
+        *thread_consultations(conversation), Consultation.status.in_(("open", "answered")),
+    ).exists()))
+    followup = select(AgentExecution.id).where(
+        AgentExecution.tenant_id == tenant_id, AgentExecution.conversation_id == conversation.id,
+        AgentExecution.reply_id == Message.id, AgentExecution.resume_source_id.is_not(None),
+    ).exists()
+    query = select(Message, SMSDelivery, followup).join(
+        SMSDelivery, (SMSDelivery.id == Message.id) & (SMSDelivery.tenant_id == Message.tenant_id)
+        & (SMSDelivery.conversation_id == Message.conversation_id),
+    ).where(
+        Message.tenant_id == tenant_id, Message.conversation_id == conversation.id,
+        Message.direction == "outbound", SMSDelivery.provider == "simulation",
+    ).order_by(Message.created_at.desc(), Message.id.desc())
+    # The interactive simulator needs a complete snapshot to observe older rows that
+    # finish delivery later and messages delivered between refreshes.
+    rows = (await session.execute(query if include_all else query.limit(50))).all()
+    return {
+        "conversation_id": conversation.id, "owner": conversation.owner, "waiting_for_staff": waiting,
+        "outbound": [{
+            "id": message.id, "body": message.body if delivery.status == "delivered" else None,
+            "source": "staff" if message.employee_id else "advisor_followup" if resumed else "advisor",
+            "status": delivery.status, "error_code": delivery.error_code, "delivered_at": delivery.delivered_at,
+        } for message, delivery, resumed in reversed(rows)],
+    }
 
 
 @router.get("/simulations/sms/{conversation_id}/appointment-actions")

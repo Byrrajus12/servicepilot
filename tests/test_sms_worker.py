@@ -17,7 +17,7 @@ from servicepilot.sms.models import SMSDelivery
 from servicepilot.sms.transport import SendError, SimulationTransport
 from test_agent import agent_path
 from test_appointment_actions import audit, scenario
-from test_conversations import FOREIGN_HEADERS, LOCAL_HEADERS, simulate, sms_api, sms_data
+from test_conversations import FOREIGN_HEADERS, LOCAL_HEADERS, SHARED_PHONE, simulate, sms_api, sms_data
 
 
 def settings_for(api):
@@ -68,6 +68,15 @@ async def test_ingestion_to_delivery_and_tenant_diagnostics(simple_model, sms_ap
     ))) == 1
     delivery = (await sms_api.get(path, headers=LOCAL_HEADERS)).json()
     assert delivery["status"] == "delivered" and delivery["attempts"] == 1
+    params = {"sender_phone": SHARED_PHONE, "include_all": "true"}
+    inbox = (await sms_api.get("/simulations/sms", params=params, headers=LOCAL_HEADERS)).json()
+    assert datetime.fromisoformat(inbox["outbound"][0].pop("delivered_at")) == datetime.fromisoformat(delivery["delivered_at"])
+    assert inbox["outbound"] == [{
+        "id": done["reply"]["id"], "body": done["reply"]["body"], "source": "advisor",
+        "status": "delivered", "error_code": None,
+    }]
+    foreign = (await sms_api.get("/simulations/sms", params=params, headers=FOREIGN_HEADERS)).json()
+    assert foreign["outbound"] == []
     duplicate = await simulate(sms_api, external_message_id="retry-same-provider-id")
     assert duplicate["status"] == "duplicate" and duplicate["message_id"] == receipt["message_id"]
     assert not await execution.process_next(sessions, settings_for(sms_api))
