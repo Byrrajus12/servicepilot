@@ -7,6 +7,7 @@ from servicepilot.conversations.models import Conversation, CustomerResolution, 
 from servicepilot.conversations.pending import retire_pending
 from servicepilot.conversations.schemas import InboundResult, InboundSMS
 from servicepilot.customers.models import Customer
+from servicepilot.staff.consultations import cancel_consultations
 
 
 async def resolve_customer(
@@ -56,6 +57,8 @@ async def persist_inbound(
         resolution, customer_id,
     ):
         retire_pending(session, conversation, "identity_required")
+        await cancel_consultations(session, conversation, await session.scalar(select(func.clock_timestamp())))
+        conversation.conditional_request = None
         if conversation.customer_id is not None:
             # A new customer association must not inherit another customer's thread or pending action.
             conversation.status = "closed"

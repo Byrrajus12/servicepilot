@@ -13,6 +13,7 @@ from servicepilot.conversations.schemas import InboundResult, InboundSMS
 from servicepilot.conversations.service import persist_inbound
 from servicepilot.sms.models import SMSConsent, SMSDelivery
 from servicepilot.sms.policy import consent_for, is_suppressed
+from servicepilot.staff.consultations import cancel_consultations
 
 STOP_WORDS = {"STOP", "STOPALL", "UNSUBSCRIBE", "CANCEL", "END", "QUIT", "REVOKE", "OPTOUT"}
 START_WORDS = {"START", "UNSTOP", "YES"}
@@ -66,6 +67,8 @@ async def ingest_sms(
             consent.last_opt_out_at = message.created_at
             conversation = await session.get_one(Conversation, receipt.conversation_id)
             retire_pending(session, conversation, "superseded")
+            conversation.conditional_request = None
+            await cancel_consultations(session, conversation, message.created_at)
     elif command is None and not is_suppressed(consent, message.created_at):
         count = await session.scalar(select(func.count()).select_from(Message).where(
             Message.tenant_id == tenant_id, Message.conversation_id == receipt.conversation_id,
