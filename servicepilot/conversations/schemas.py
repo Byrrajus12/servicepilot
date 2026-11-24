@@ -35,3 +35,4 @@ class InboundResult(BaseModel):
     conversation_id: UUID
     message_id: UUID
     status: Literal["persisted", "duplicate"]
+    processing: Literal["queued", "suppressed", "control", "rate_limited", "loop_guard"] | None = "queued"

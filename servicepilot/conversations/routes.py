@@ -2,20 +2,25 @@ from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query, Request
+from pydantic import ValidationError
 from sqlalchemy import func, select
 
 from servicepilot.agent.execution import (
-    ExecutionView, PreviousMessagePending, enqueue, get_execution, process_execution,
+    ExecutionView, PreviousMessagePending, get_execution, process_execution,
 )
+from servicepilot.config import SIMULATED_RECIPIENT
 from servicepilot.conversations.context import HistoryMessage, read_history
 from servicepilot.conversations.models import Conversation
 from servicepilot.conversations.pending import AppointmentActionResult, pending_proposal
 from servicepilot.conversations.schemas import InboundResult, InboundSMS, SMSContent
-from servicepilot.conversations.service import persist_inbound
+from servicepilot.sms.delivery import DeliveryView, deliver_next
+from servicepilot.sms.ingest import ingest_sms
+from servicepilot.sms.models import SMSDelivery
+from servicepilot.sms.request import read_sms_body
+from servicepilot.sms.transport import SimulationTransport
 from servicepilot.tenancy.auth import AuthenticatedDealership, DealershipTransaction
 
 router = APIRouter()
-SIMULATED_RECIPIENT = "+12065550100"
 
 
 def require_simulation(request: Request) -> None:
@@ -37,6 +42,7 @@ async def simulated_appointment_actions(
     if conversation is None:
         raise HTTPException(404, "Conversation not found")
     proposal = pending_proposal(conversation)
+    delivery = await session.get(SMSDelivery, proposal.prompt_id) if proposal else None
     now = await session.scalar(select(func.clock_timestamp()))
     results = await session.scalars(select(AppointmentActionResult).where(
         AppointmentActionResult.tenant_id == tenant_id, AppointmentActionResult.conversation_id == conversation_id,
@@ -46,6 +52,7 @@ async def simulated_appointment_actions(
             "proposal": proposal,
             "expires_at": conversation.pending_action_expires_at,
             "status": "expired" if conversation.pending_action_expires_at <= now else "awaiting_confirmation",
+            "prompt_delivery_status": delivery.status if delivery is not None else None,
         } if proposal else None,
         "results": [{
             "proposal": row.proposal, "outcome": row.outcome, "decision_message_id": row.decision_message_id,
@@ -55,18 +62,24 @@ async def simulated_appointment_actions(
     }
 
 
-@router.post("/simulations/sms")
+@router.post("/simulations/sms", openapi_extra={
+    "requestBody": {"required": True, "content": {"application/json": {"schema": SMSContent.model_json_schema()}}},
+})
 async def simulate_sms(
-    sms: SMSContent, dealership: DealershipTransaction, request: Request,
+    dealership: DealershipTransaction, request: Request,
 ) -> InboundResult:
     require_simulation(request)
+    try:
+        sms = SMSContent.model_validate_json(await read_sms_body(request))
+    except ValidationError:
+        raise HTTPException(422, "Invalid SMS content") from None
+    if sms.sender_phone == SIMULATED_RECIPIENT:
+        raise HTTPException(422, "Sender cannot be the simulation recipient")
     session, tenant_id = dealership
-    inbound = await persist_inbound(
-        session, tenant_id,
+    return await ingest_sms(
+        session, request.app.state.settings, tenant_id,
         InboundSMS(**sms.model_dump(), provider="simulation", recipient_phone=SIMULATED_RECIPIENT),
     )
-    enqueue(session, tenant_id, inbound)
-    return inbound
 
 
 @router.get("/simulations/sms/{conversation_id}/messages")
@@ -90,10 +103,30 @@ async def simulated_execution(
 ) -> ExecutionView:
     require_simulation(request)
     session, tenant_id = dealership
+    if not await session.scalar(select(Conversation.id).where(
+        Conversation.tenant_id == tenant_id, Conversation.id == conversation_id,
+        Conversation.recipient_number == SIMULATED_RECIPIENT,
+    )):
+        raise HTTPException(404, "Agent execution not found")
     result = await get_execution(session, tenant_id, conversation_id, message_id)
     if result is None:
         raise HTTPException(404, "Agent execution not found")
     return result
+
+
+@router.get("/simulations/sms/{conversation_id}/messages/{message_id}/delivery")
+async def simulated_delivery(
+    conversation_id: UUID, message_id: UUID, dealership: DealershipTransaction, request: Request,
+) -> DeliveryView:
+    require_simulation(request)
+    session, tenant_id = dealership
+    row = await session.scalar(select(SMSDelivery).where(
+        SMSDelivery.tenant_id == tenant_id, SMSDelivery.conversation_id == conversation_id,
+        SMSDelivery.provider == "simulation", SMSDelivery.id == message_id,
+    ))
+    if row is None:
+        raise HTTPException(404, "Delivery not found")
+    return DeliveryView.model_validate(row)
 
 
 @router.post("/simulations/sms/{conversation_id}/messages/{message_id}/agent")
@@ -111,4 +144,9 @@ async def process_simulated_execution(
         }) from None
     if result is None:
         raise HTTPException(404, "Agent execution not found")
+    if result.reply is not None:
+        await deliver_next(
+            request.app.state.session_factory, request.app.state.settings,
+            {"simulation": SimulationTransport()}, delivery_id=result.reply.id,
+        )
     return result
