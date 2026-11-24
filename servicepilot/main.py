@@ -14,6 +14,7 @@ from servicepilot.appointments.service import AppointmentError
 from servicepilot.config import Settings
 from servicepilot.conversations.routes import router as sms_simulation_router
 from servicepilot.db.session import build_engine, build_session_factory
+from servicepilot.sms.routes import router as twilio_router
 
 
 class HealthStatus(BaseModel):
@@ -35,6 +36,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(title="ServicePilot", lifespan=lifespan)
     app.include_router(router)
     app.include_router(sms_simulation_router)
+    app.include_router(twilio_router)
     app.add_exception_handler(AppointmentError, appointment_error)
 
     @app.get("/health")
