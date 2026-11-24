@@ -1,4 +1,4 @@
-"""Run an opt-in semantic smoke test against gpt-4.1-mini with synthetic SMS and no database."""
+"""Run an opt-in semantic smoke test against AGENT_MODEL with synthetic SMS and no database."""
 
 import asyncio
 import json
@@ -17,17 +17,22 @@ from servicepilot.conversations.pending import PublishedProposal
 CASES = (
     ("informal agreement", "ye go ahead", "confirm"),
     ("terse agreement", "ya", "confirm"),
+    ("enthusiastic agreement", "Yawww", "confirm"),
+    ("new informal agreement", "yuppp works for me", "confirm"),
+    ("uncertain agreement", "umm maybe, let me think", "clarify"),
     ("decline", "nah leave it where it is", "decline"),
     ("revision", "Actually make it Wednesday at 9.", "revise"),
     ("agreement with a change", "yes but can you do Wednesday at 9 instead", "revise"),
-    ("conditional agreement", "go ahead if there isn't a fee", "clarify"),
+    ("conditional agreement", "go ahead if there isn't a fee", "conditional"),
+    ("substantive question", "Do you charge for moving it?", "question"),
+    ("unrelated question", "What other services yall got?", "unrelated"),
     ("superseded proposal", "yeah the first time you offered", "clarify"),
 )
 
 
 async def evaluate() -> bool:
     settings = Settings(
-        database_url="postgresql+asyncpg://localhost/unused", agent_model="gpt-4.1-mini", sms_transport="simulation",
+        database_url="postgresql+asyncpg://localhost/unused", sms_transport="simulation",
     )
     if not settings.openai_api_key:
         raise SystemExit("Set OPENAI_API_KEY in your environment or .env.")
@@ -65,6 +70,8 @@ async def evaluate() -> bool:
         passed = diagnostic.interpretation == "decided" and diagnostic.tool_invocations == 1 and (
             diagnostic.decision == expected
         )
+        if expected == "confirm":
+            passed &= not diagnostic.explicit_proposal_reference
         all_passed &= passed
         print(f"{'PASS' if passed else 'FAIL'} {label} (expected {expected}, got "
               f"{diagnostic.decision or diagnostic.interpretation})")
