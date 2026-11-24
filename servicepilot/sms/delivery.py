@@ -4,7 +4,7 @@ from logging import getLogger
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import exists, func, or_, select, tuple_
+from sqlalchemy import String, cast, exists, func, null, or_, select, tuple_, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import aliased
 
@@ -12,12 +12,14 @@ from servicepilot.config import Settings
 from servicepilot.conversations.context import current_identity
 from servicepilot.conversations.models import Conversation, Message
 from servicepilot.conversations.pending import pending_proposal
+from servicepilot.sms.fence import delivery_fence
 from servicepilot.sms.models import DeliveryStatus, SMSDelivery
 from servicepilot.sms.policy import consent_for, is_suppressed, twilio_channel, twilio_route_matches
 from servicepilot.sms.retry import retry_delay
 from servicepilot.sms.transport import (
     SEND_TIMEOUT_SECONDS, OutboundSMS, SendError, SendReceipt, SMSTransport,
 )
+from servicepilot.staff.consultations import consultation_delivery_relevant, unfinished_customer_turn
 
 logger = getLogger(__name__)
 TERMINAL = {"delivered", "failed", "undelivered"}
@@ -43,6 +45,8 @@ class DeliveryView(BaseModel):
 def enqueue_reply(
     session: AsyncSession, message: Message, *,
     confirmation_for_id: UUID | None = None, expires_at: datetime | None = None,
+    ownership_version: int | None = 0,
+    inbound_guard_id: UUID | None = None,
 ) -> None:
     if message.provider == "simulation":
         provider, account = "simulation", None
@@ -55,6 +59,8 @@ def enqueue_reply(
         provider=provider, account_sid=account, sender=message.from_number, recipient=message.to_number,
         next_attempt_at=message.created_at, created_at=message.created_at, status="pending",
         confirmation_for_id=confirmation_for_id, expires_at=expires_at,
+        ai_ownership_version=ownership_version if ownership_version is not None else null(),
+        inbound_guard_id=inbound_guard_id,
     ))
 
 
@@ -82,7 +88,7 @@ def fail_delivery(row: SMSDelivery, code: str, *, status="failed") -> None:
 
 async def _claim_delivery(
     session: AsyncSession, settings: Settings, delivery_id: UUID | None,
-) -> tuple[OutboundSMS, str, int] | bool:
+) -> tuple[OutboundSMS, str, int, UUID, UUID, int | None] | bool:
     previous = aliased(SMSDelivery)
     no_earlier_work = ~exists(select(previous.id).where(
         previous.tenant_id == SMSDelivery.tenant_id, previous.conversation_id == SMSDelivery.conversation_id,
@@ -95,6 +101,17 @@ async def _claim_delivery(
             (SMSDelivery.status == "sending") & (SMSDelivery.lease_expires_at <= func.now()),
         ),
         no_earlier_work,
+        or_(
+            SMSDelivery.inbound_guard_id.is_(None),
+            ~unfinished_customer_turn(
+                SMSDelivery.tenant_id, SMSDelivery.conversation_id, after_id=SMSDelivery.inbound_guard_id,
+            ),
+            ~exists(select(Conversation.id).where(
+                Conversation.id == SMSDelivery.conversation_id, Conversation.tenant_id == SMSDelivery.tenant_id,
+                Conversation.owner == "ai", Conversation.ownership_version == SMSDelivery.ai_ownership_version,
+                Conversation.status == "open",
+            )),
+        ),
     )
     if delivery_id is not None:
         query = query.where(SMSDelivery.id == delivery_id, SMSDelivery.provider == "simulation")
@@ -103,7 +120,7 @@ async def _claim_delivery(
     ).limit(1).with_for_update(skip_locked=True, of=SMSDelivery))
     if row is None:
         return False
-    if row.status == "sending" and row.provider == "twilio":
+    if row.status == "sending" and row.provider == "twilio" and row.submission_started:
         fail_delivery(row, "twilio_acceptance_unknown", status="uncertain")
         logger.warning("SMS delivery %s has unknown provider acceptance", row.id)
         return True
@@ -113,9 +130,19 @@ async def _claim_delivery(
 
     # Serialize the claim against an opt-out or proposal revision on the same thread.
     conversation = await session.get_one(Conversation, row.conversation_id, with_for_update=True)
+    if row.ai_ownership_version is not None and (
+        conversation.owner != "ai" or conversation.ownership_version != row.ai_ownership_version
+    ):
+        fail_delivery(row, "ownership_changed")
+        return True
     if conversation.status != "open":
         fail_delivery(row, "conversation_closed")
         return True
+    if row.inbound_guard_id is not None:
+        relevance = consultation_delivery_relevant(SMSDelivery)
+        if not await session.scalar(select(relevance).select_from(SMSDelivery).where(SMSDelivery.id == row.id)):
+            fail_delivery(row, "consultation_superseded")
+            return True
     resolution, customer = await current_identity(session, conversation)
     if (resolution, customer.id if customer else None) != (conversation.customer_resolution, conversation.customer_id):
         fail_delivery(row, "identity_changed")
@@ -142,10 +169,14 @@ async def _claim_delivery(
             return True
     message = await session.get_one(Message, row.id)
     row.status = "sending"
+    row.submission_started = False
     row.attempts += 1
     row.next_attempt_at = None
     row.lease_expires_at = now + timedelta(seconds=SEND_TIMEOUT_SECONDS + 15)
-    return OutboundSMS(row.id, row.sender, row.recipient, message.body, min(300, remaining)), row.provider, row.attempts
+    return (
+        OutboundSMS(row.id, row.sender, row.recipient, message.body, min(300, remaining)),
+        row.provider, row.attempts, row.tenant_id, row.conversation_id, row.ai_ownership_version,
+    )
 
 
 async def deliver_next(
@@ -157,11 +188,49 @@ async def deliver_next(
     if isinstance(claimed, bool):
         return claimed
 
-    sms, provider, attempt = claimed
+    sms, provider, attempt, tenant_id, conversation_id, version = claimed
     receipt = failure = None
     try:
-        async with timeout(SEND_TIMEOUT_SECONDS):
-            receipt = await transports[provider].send(sms)
+        async with delivery_fence(sessions, tenant_id, conversation_id) as connection:
+            attempt_row = (
+                SMSDelivery.id == sms.id, SMSDelivery.tenant_id == tenant_id,
+                SMSDelivery.conversation_id == conversation_id, SMSDelivery.status == "sending",
+                SMSDelivery.attempts == attempt,
+                SMSDelivery.lease_expires_at > func.clock_timestamp(),
+            )
+            eligibility = ()
+            if version is not None:
+                waiting = unfinished_customer_turn(tenant_id, conversation_id, after_id=SMSDelivery.inbound_guard_id)
+                relevant = consultation_delivery_relevant(SMSDelivery)
+                eligibility = (
+                    exists(select(Conversation.id).where(
+                        Conversation.id == conversation_id, Conversation.tenant_id == tenant_id,
+                        Conversation.owner == "ai", Conversation.ownership_version == version,
+                        Conversation.status == "open",
+                        or_(SMSDelivery.confirmation_for_id.is_(None),
+                            Conversation.pending_action_payload["prompt_id"].astext
+                            == cast(SMSDelivery.confirmation_for_id, String)),
+                    ).correlate(SMSDelivery)),
+                    or_(SMSDelivery.expires_at.is_(None), SMSDelivery.expires_at > func.clock_timestamp()),
+                    or_(SMSDelivery.inbound_guard_id.is_(None), ~waiting & relevant),
+                )
+            submission = await connection.scalar(update(SMSDelivery).where(
+                *attempt_row, *eligibility,
+            ).values(submission_started=True).returning(SMSDelivery.id))
+            if submission is None:
+                if version is not None:
+                    deferred = await connection.scalar(update(SMSDelivery).where(
+                        *attempt_row, SMSDelivery.inbound_guard_id.is_not(None), waiting, relevant,
+                    ).values(status="pending", lease_expires_at=None, next_attempt_at=func.now(),
+                             attempts=SMSDelivery.attempts - 1).returning(SMSDelivery.id))
+                    if deferred is not None:
+                        return True
+                await connection.execute(update(SMSDelivery).where(*attempt_row).values(
+                    status="failed", lease_expires_at=None, error_code="ownership_or_lease_changed",
+                ))
+                return True
+            async with timeout(SEND_TIMEOUT_SECONDS):
+                receipt = await transports[provider].send(sms)
     except SendError as exc:
         failure = exc
     except TimeoutError:
@@ -176,6 +245,7 @@ async def deliver_next(
             apply_receipt(row, receipt, now)
         elif failure.kind == "retryable" and attempt < settings.sms_delivery_max_attempts:
             row.status = "pending"
+            row.submission_started = False
             row.next_attempt_at = now + retry_delay(settings.worker_retry_base_seconds, attempt)
             row.lease_expires_at = None
             row.error_code = failure.code
