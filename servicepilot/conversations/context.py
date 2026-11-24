@@ -3,7 +3,7 @@ from typing import Literal
 from uuid import UUID
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, JsonValue
-from sqlalchemy import or_, select, tuple_
+from sqlalchemy import exists, or_, select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from servicepilot.appointments.schemas import AppointmentResponse, CustomerResponse, VehicleResponse
@@ -13,6 +13,7 @@ from servicepilot.conversations.models import (
 from servicepilot.conversations.service import resolve_customer
 from servicepilot.customers.models import Customer
 from servicepilot.integrations.mock_dms import MockDMSAdapter
+from servicepilot.sms.models import SMSDelivery
 
 
 class DealershipContext(BaseModel):
@@ -148,9 +149,17 @@ async def read_history(
         Message.tenant_id == tenant_id, Message.conversation_id == conversation_id,
     )
     if before_inbound is not None:
+        outbound = Message.direction == "outbound"
+        if before_inbound.provider.startswith("twilio-"):
+            outbound = outbound & exists(select(SMSDelivery.id).where(
+                SMSDelivery.id == Message.id, SMSDelivery.tenant_id == Message.tenant_id,
+                SMSDelivery.conversation_id == Message.conversation_id,
+                SMSDelivery.status == "delivered", SMSDelivery.delivered_at < before_inbound.created_at,
+            ))
         query = query.where(or_(
-            Message.direction == "outbound",
-            tuple_(Message.created_at, Message.id) < (before_inbound.created_at, before_inbound.id),
+            outbound,
+            (Message.direction == "inbound")
+            & (tuple_(Message.created_at, Message.id) < (before_inbound.created_at, before_inbound.id)),
         ))
     newest = (await session.scalars(
         query.order_by(Message.occurred_at.desc(), Message.created_at.desc(), Message.id.desc())
