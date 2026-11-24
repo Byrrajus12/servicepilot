@@ -19,7 +19,7 @@ from servicepilot.staff.auth import (
     EmployeeTransaction, hash_password, new_session, password_jobs, password_matches, unauthorized,
 )
 from servicepilot.staff.consultations import thread_consultations
-from servicepilot.staff.models import Consultation, Employee, EmployeeRole, EmployeeSession, StaffNote
+from servicepilot.staff.models import Consultation, Employee, EmployeeRole, EmployeeSession, OwnershipEvent, StaffNote
 from servicepilot.tenancy.models import Tenant
 
 
@@ -63,6 +63,9 @@ class CreateEmployee(Input):
 
 class EmployeeState(Input):
     disabled: bool
+
+class Assign(Input):
+    employee_id: UUID | None
 
 class Note(Input):
     body: MessageText
@@ -303,3 +306,45 @@ async def add_note(conversation_id: UUID, body: InternalNote, tx: EmployeeTransa
     session.add(note)
     await session.flush()
     return record_view(note, "employee_id body reply_to_id")
+
+@router.get("/conversations/{conversation_id}/ownership-events")
+async def ownership_events(conversation_id: UUID, tx: EmployeeTransaction, page: Pagination) -> list[dict]:
+    session, employee, _ = tx
+    await get_thread(session, employee, conversation_id)
+    events = await session.scalars(select(OwnershipEvent).where(
+        OwnershipEvent.tenant_id == employee.tenant_id, OwnershipEvent.conversation_id == conversation_id,
+    ).order_by(OwnershipEvent.created_at.desc(), OwnershipEvent.id.desc()).offset(page.offset).limit(page.limit))
+    return [record_view(event, "employee_id assigned_id previous_owner owner ownership_version") for event in events]
+
+
+def audit_owner(session: AsyncSession, conversation: Conversation, employee: Employee, previous_owner: str) -> None:
+    session.add(OwnershipEvent(
+        tenant_id=employee.tenant_id, conversation_id=conversation.id, employee_id=employee.id,
+        previous_owner=previous_owner, owner=conversation.owner, assigned_id=conversation.assigned_employee_id,
+        ownership_version=conversation.ownership_version,
+    ))
+
+
+@router.put("/conversations/{conversation_id}/assignment")
+async def assign(conversation_id: UUID, body: Assign, tx: EmployeeTransaction) -> dict:
+    session, employee, _ = tx
+    conversation = await get_thread(session, employee, conversation_id, write=True)
+    require_assignment(employee, conversation.assigned_employee_id)
+    require_assignment(employee, body.employee_id)
+    if conversation.assigned_employee_id == body.employee_id:
+        return await view_thread(session, conversation)
+    if conversation.owner == "human" and body.employee_id is None:
+        raise HTTPException(409, "Return to AI before clearing the assignment")
+    if body.employee_id is not None:
+        target = await session.scalar(select(Employee.id).where(
+            Employee.tenant_id == employee.tenant_id, Employee.id == body.employee_id, Employee.disabled.is_(False),
+        ))
+        if target is None:
+            raise HTTPException(404, "Active employee not found")
+    conversation.assigned_employee_id = body.employee_id
+    conversation.updated_at = await session.scalar(select(func.clock_timestamp()))
+    await session.execute(update(Consultation).where(
+        *thread_consultations(conversation), Consultation.status == "open",
+    ).values(assigned_id=body.employee_id))
+    audit_owner(session, conversation, employee, conversation.owner)
+    return await view_thread(session, conversation)
