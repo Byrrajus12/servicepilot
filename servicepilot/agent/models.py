@@ -24,7 +24,7 @@ class AgentExecution(TenantOwned, Base):
         ),
         Index(
             "ix_agent_executions_unfinished_conversation", "tenant_id", "conversation_id",
-            postgresql_where=text("status != 'completed'"),
+            postgresql_where=text("status IN ('pending', 'running') OR next_attempt_at IS NOT NULL"),
         ),
         Index(
             "uq_agent_executions_running_conversation", "tenant_id", "conversation_id",
@@ -33,6 +33,7 @@ class AgentExecution(TenantOwned, Base):
         CheckConstraint("status IN ('pending', 'running', 'completed', 'failed')", name="status"),
         CheckConstraint("(status = 'running') = (lease_expires_at IS NOT NULL)", name="lease"),
         CheckConstraint("(status = 'completed') = (reply_id IS NOT NULL)", name="reply"),
+        CheckConstraint("next_attempt_at IS NULL OR status = 'failed'", name="retry"),
     )
 
     # The primary key is the inbound message ID, so an inbound SMS has at most one execution.
@@ -41,6 +42,7 @@ class AgentExecution(TenantOwned, Base):
     status: Mapped[ExecutionStatus] = mapped_column(String(16), server_default="pending")
     attempts: Mapped[int] = mapped_column(server_default="0")
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     reply_id: Mapped[UUID | None]
     model: Mapped[str | None] = mapped_column(String(120))
     duration_ms: Mapped[int | None]
