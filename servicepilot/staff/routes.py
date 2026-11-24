@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, datetime
 from typing import Annotated, Literal
 from uuid import UUID
 
@@ -13,18 +13,19 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from servicepilot.agent.actions import lock_conversation
 from servicepilot.agent.models import AgentExecution
-from servicepilot.conversations.context import build_context
+from servicepilot.conversations.context import build_context, current_identity
 from servicepilot.conversations.models import Conversation, Message
 from servicepilot.conversations.pending import retire_pending
+from servicepilot.sms.delivery import enqueue_reply
 from servicepilot.sms.fence import lock_ownership_change
 from servicepilot.sms.models import SMSDelivery
+from servicepilot.sms.policy import consent_for, is_suppressed, twilio_route_matches
 from servicepilot.staff.auth import (
     EmployeeTransaction, hash_password, new_session, password_jobs, password_matches, unauthorized,
 )
-from servicepilot.staff.consultations import cancel_consultations, enqueue_answer, thread_consultations
+from servicepilot.staff.consultations import cancel_consultations, enqueue_answer, latest_inbound, thread_consultations
 from servicepilot.staff.models import Consultation, Employee, EmployeeRole, EmployeeSession, OwnershipEvent, StaffNote
 from servicepilot.tenancy.models import Tenant
-
 
 class StaffRoute(APIRoute):
     def get_route_handler(self):
@@ -57,6 +58,7 @@ class Login(Input):
     username: Username
     password: SecretStr = Field(min_length=1, max_length=128)
 
+
 class CreateEmployee(Input):
     username: Username
     display_name: Annotated[ShortText, Field(max_length=120)]
@@ -67,11 +69,14 @@ class CreateEmployee(Input):
 class EmployeeState(Input):
     disabled: bool
 
+
 class Assign(Input):
     employee_id: UUID | None
 
+
 class Ownership(Input):
     expected_version: int = Field(ge=0)
+
 
 class Note(Input):
     body: MessageText
@@ -80,8 +85,14 @@ class Note(Input):
 class InternalNote(Note):
     reply_to_id: UUID | None = None
 
+
+class Reply(Note):
+    request_id: UUID
+
+
 class Answer(Input):
     public_fact: ShortText
+
 
 class ServiceInformation(Input):
     name: Annotated[ShortText, Field(max_length=120)]
@@ -101,6 +112,7 @@ class ServiceSettings(Input):
             raise ValueError("Service names must be unique")
         return services
 
+
 class Page:
     def __init__(
         self, limit: Annotated[int, Query(ge=1, le=50)] = 20,
@@ -111,8 +123,10 @@ class Page:
 
 Pagination = Annotated[Page, Depends()]
 
+
 def employee_view(employee: Employee) -> dict:
     return {key: getattr(employee, key) for key in ("id", "username", "display_name", "role", "disabled")}
+
 
 def conversation_view(conversation: Conversation, waiting: bool) -> dict:
     return {
@@ -125,19 +139,23 @@ def conversation_view(conversation: Conversation, waiting: bool) -> dict:
 def record_view(item, fields: str) -> dict:
     return {key: getattr(item, key) for key in ("id", "created_at", *fields.split())}
 
+
 def consultation_view(consultation: Consultation) -> dict:
     return record_view(
         consultation, "conversation_id execution_id inbound_id question status assigned_id public_fact "
         "answered_by answered_at resolved_at updated_at",
     )
 
+
 def require_manager(employee: Employee) -> None:
     if employee.role != "manager":
         raise HTTPException(403, "Manager permission required")
 
+
 def require_assignment(employee: Employee, assigned: UUID | None) -> None:
     if assigned not in (None, employee.id) and employee.role != "manager":
         raise HTTPException(403, "Assigned to another employee")
+
 
 async def get_thread(
     session: AsyncSession, employee: Employee, conversation_id: UUID, *, write: bool = False,
@@ -168,6 +186,7 @@ async def view_thread(session: AsyncSession, conversation: Conversation) -> dict
     )))
     return conversation_view(conversation, waiting)
 
+
 @router.post("/sessions")
 async def login(body: Login, request: Request, response: Response) -> dict:
     sessions = request.app.state.session_factory
@@ -197,6 +216,7 @@ async def logout(tx: EmployeeTransaction) -> Response:
 async def me(tx: EmployeeTransaction) -> dict:
     _, employee, _ = tx
     return employee_view(employee) | {"tenant_id": employee.tenant_id}
+
 
 @router.get("/employees")
 async def employees(tx: EmployeeTransaction, page: Pagination) -> list[dict]:
@@ -240,6 +260,7 @@ async def change_employee(employee_id: UUID, body: EmployeeState, tx: EmployeeTr
         ).values(revoked_at=func.clock_timestamp()))
     return employee_view(target)
 
+
 @router.put("/service-settings")
 async def set_service_information(body: ServiceSettings, tx: EmployeeTransaction) -> ServiceSettings:
     session, employee, _ = tx
@@ -250,6 +271,7 @@ async def set_service_information(body: ServiceSettings, tx: EmployeeTransaction
     dealer.service_policies = body.policies
     dealer.closed_dates = sorted(set(body.closed_dates))
     return body
+
 
 @router.get("/conversations")
 async def conversations(
@@ -294,6 +316,7 @@ async def messages(conversation_id: UUID, tx: EmployeeTransaction, page: Paginat
         for message, status, error_code in rows
     ]
 
+
 @router.get("/conversations/{conversation_id}/notes")
 async def notes(conversation_id: UUID, tx: EmployeeTransaction, page: Pagination) -> list[dict]:
     session, employee, _ = tx
@@ -321,6 +344,7 @@ async def add_note(conversation_id: UUID, body: InternalNote, tx: EmployeeTransa
     session.add(note)
     await session.flush()
     return record_view(note, "employee_id body reply_to_id")
+
 
 @router.get("/consultations")
 async def consultations(
@@ -382,6 +406,7 @@ async def cancel(conversation_id: UUID, consultation_id: UUID, tx: EmployeeTrans
         consultation.resolved_at = consultation.updated_at = now
     return consultation_view(consultation)
 
+
 @router.get("/conversations/{conversation_id}/ownership-events")
 async def ownership_events(conversation_id: UUID, tx: EmployeeTransaction, page: Pagination) -> list[dict]:
     session, employee, _ = tx
@@ -423,6 +448,7 @@ async def assign(conversation_id: UUID, body: Assign, tx: EmployeeTransaction) -
     ).values(assigned_id=body.employee_id))
     audit_owner(session, conversation, employee, conversation.owner)
     return await view_thread(session, conversation)
+
 
 def unfinished_work(conversation: Conversation):
     return update(AgentExecution).where(
@@ -472,3 +498,49 @@ async def set_ownership(
         ).values(status="pending", next_attempt_at=None, lease_expires_at=None, error_code=None))
     audit_owner(session, conversation, employee, previous)
     return await view_thread(session, conversation)
+
+
+@router.post("/conversations/{conversation_id}/replies", status_code=201)
+async def reply(conversation_id: UUID, body: Reply, tx: EmployeeTransaction, request: Request) -> dict:
+    session, employee, _ = tx
+    conversation = await get_thread(session, employee, conversation_id, write=True)
+    existing = await session.scalar(select(Message).where(
+        Message.tenant_id == employee.tenant_id, Message.conversation_id == conversation_id,
+        Message.employee_request_id == body.request_id,
+    ))
+    if existing is not None:
+        if existing.body != body.body or existing.employee_id != employee.id:
+            raise HTTPException(409, "Reply request ID already used")
+        return record_view(existing, "direction body occurred_at employee_id")
+    require_assignment(employee, conversation.assigned_employee_id)
+    if conversation.owner != "human":
+        raise HTTPException(409, "Take ownership before sending a customer reply")
+    inbound = await session.scalar(latest_inbound(conversation))
+    if inbound is None or (inbound.provider != "simulation" and not inbound.provider.startswith("twilio-")):
+        raise HTTPException(409, "Conversation has no usable SMS route")
+    resolution, customer = await current_identity(session, conversation)
+    if (resolution, customer.id if customer else None) != (conversation.customer_resolution, conversation.customer_id):
+        raise HTTPException(409, "Conversation identity changed")
+    consent = await consent_for(session, employee.tenant_id, inbound.provider, inbound.from_number, inbound.to_number)
+    if consent is not None and consent.suppressed:
+        raise HTTPException(409, "Customer has opted out of SMS")
+    if inbound.provider.startswith("twilio-") and not await twilio_route_matches(
+        session, request.app.state.settings, employee.tenant_id, inbound.provider, inbound.to_number, inbound.from_number,
+    ):
+        raise HTTPException(409, "SMS route is unavailable")
+    now = await session.scalar(select(func.clock_timestamp()))
+    if is_suppressed(consent, now):
+        raise HTTPException(409, "Customer has opted out of SMS")
+    outbound = Message(
+        tenant_id=employee.tenant_id, conversation_id=conversation_id, direction="outbound",
+        employee_id=employee.id, employee_request_id=body.request_id,
+        from_number=inbound.to_number, to_number=inbound.from_number, provider=inbound.provider,
+        body=body.body, occurred_at=now, created_at=now, updated_at=now,
+    )
+    session.add(outbound)
+    await session.flush()
+    enqueue_reply(session, outbound, ownership_version=None)
+    await session.execute(unfinished_work(conversation).values(
+        status="failed", next_attempt_at=None, lease_expires_at=None, error_code="addressed_by_employee",
+    ))
+    return record_view(outbound, "direction body occurred_at employee_id")

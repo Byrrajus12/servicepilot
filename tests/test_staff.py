@@ -136,6 +136,62 @@ async def test_employee_sessions_roles_expiry_and_tenant_isolation(sms_api, sms_
     assert (await sms_api.get("/staff/me", headers=manager)).status_code == 401
 
 
+async def test_takeover_fences_running_and_queued_ai_and_handback_retains_unanswered_sms(
+    monkeypatch, sms_api, sms_data, staff,
+):
+    sessions = sms_data[0]
+    settings = settings_for(sms_api)
+    advisor, _ = staff["advisor"]
+    colleague, _ = staff["colleague"]
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def model(_, context, model_input):
+        body = json.loads(model_input)["current_inbound_sms"]
+        if body == "In flight" and context.attempt == 1:
+            entered.set()
+            await release.wait()
+        return ModelReply(f"AI response to {body}", 1, 1)
+
+    monkeypatch.setattr(execution, "run_advisor", model)
+    first = await simulate(sms_api, body="Queued")
+    assert await execution.process_next(sessions, settings)
+    second = await simulate(sms_api, body="In flight")
+    worker = asyncio.create_task(execution.process_next(sessions, settings))
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        updates = await asyncio.gather(*(
+            set_owner(sms_api, first, headers, "human", 0) for headers in (advisor, colleague)
+        ))
+        assert sorted(response.status_code for response in updates) in ([200, 403], [200, 409])
+        owner = advisor if updates[0].status_code == 200 else colleague
+        third = await simulate(sms_api, body="Arrived during takeover")
+        assert not await execution.process_next(sessions, settings)
+        assert (await state(sms_api, third))["status"] == "pending"
+    finally:
+        release.set()
+        await worker
+    assert (await state(sms_api, second))["reply"] is None
+    transport = RecordingTransport()
+    await drain_delivery(sms_api, sessions, transport)
+    assert transport.bodies == []
+
+    payload = {"body": "I'm the service advisor handling this.", "request_id": str(uuid4())}
+    replies = [
+        await sms_api.post(thread(first) + "/replies", headers=owner, json=payload) for _ in range(2)
+    ]
+    assert all(response.status_code == 201 for response in replies)
+    assert replies[0].json()["id"] == replies[1].json()["id"]
+    assert (await state(sms_api, second))["error_code"] == "addressed_by_employee"
+
+    unanswered = await simulate(sms_api, body="Another question after staff replied")
+    assert (await set_owner(sms_api, first, owner, "ai", 1)).status_code == 200
+    assert await execution.process_next(sessions, settings)
+    assert (await state(sms_api, unanswered))["status"] == "completed"
+    await drain_delivery(sms_api, sessions, transport)
+    assert transport.bodies == [payload["body"], "AI response to Another question after staff replied"]
+    assert not await execution.process_next(sessions, settings)
+
+
 async def test_takeover_between_outbox_claim_and_send(monkeypatch, sms_api, sms_data, staff):
     from contextlib import asynccontextmanager
 
